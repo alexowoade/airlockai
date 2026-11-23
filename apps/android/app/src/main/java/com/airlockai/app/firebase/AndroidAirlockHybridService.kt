@@ -7,6 +7,7 @@ import com.airlockai.app.core.*
 import com.google.firebase.Firebase
 import com.google.firebase.FirebaseApp
 import com.google.firebase.ai.InferenceMode
+import com.google.firebase.ai.InferenceSource
 import com.google.firebase.ai.OnDeviceConfig
 import com.google.firebase.ai.OnDeviceModelOption
 import com.google.firebase.ai.ai
@@ -180,7 +181,7 @@ class AndroidAirlockHybridService(context: Context) {
             "Give a 1-sentence risk triage using ONLY the existing placeholder tokens:\n\n${verified.sanitizedText}"
         )
         val latency = System.currentTimeMillis() - t0
-        val source = response.inferenceSource.name // ON_DEVICE or IN_CLOUD
+        val source = if (response.inferenceSource == InferenceSource.ON_DEVICE) "ON_DEVICE" else "IN_CLOUD"
         return AndroidTriageOutput(
             summary = response.text ?: "(empty response)",
             inferenceSource = source,
