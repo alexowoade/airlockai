@@ -1,0 +1,40 @@
+AirlockAI — Phase 5 Final Launch & Submission Checklist
+========================================================
+
+1. Extract Phase 5 package into your repo root:
+   cd ~/airlockai/airlockai
+   unzip -o ~/Downloads/airlockai-phase5.zip -d .
+   chmod +x scripts/pre-submission-audit.sh
+
+2. Verify the 4 Spark-tier services in Firebase Console (https://console.firebase.google.com/project/airlockai-2026-alex):
+   [ ] Authentication -> Sign-in method -> Anonymous enabled
+   [ ] AI Logic -> Gemini Developer API enabled (Spark $0 tier)
+   [ ] AI Logic -> Prompt templates created:
+       - airlock-nda-v1-0-0
+       - airlock-hipaa-v1-0-0
+       - airlock-invoice-v1-0-0
+       (Keep project-wide "template-only mode" OFF so PREFER_ON_DEVICE works)
+   [ ] Remote Config -> Parameter `airlock_policy` published
+   [ ] App Check -> Fraud Defense registered on App ID 1:861214881056:web:36c26fac253597e1c8d345 (DONE)
+       Confirm `https://airlockai-2026-alex.web.app` shows HTTP 200 on `exchangeRecaptchaEnterpriseToken` in DevTools Network before flipping Enforce ON.
+
+3. Run the automated Pre-Submission Audit:
+   ./scripts/pre-submission-audit.sh
+
+4. Commit & push clean public repo to GitHub (https://github.com/alexowoade/airlockai):
+   git status
+   git add .
+   git commit -m "feat: AirlockAI zero-leakage hybrid document auditor (Web, Chrome MV3, Android)"
+   git branch -M main
+   git remote add origin https://github.com/alexowoade/airlockai.git
+   git push -u origin main
+
+5. Confirm GitHub checks:
+   [ ] Repo is PUBLIC and displays "Apache-2.0 license" badge on the right sidebar
+   [ ] GitHub Actions CI passes BOTH jobs:
+       - TypeScript Core Proofs + Web PWA + Chrome Extension
+       - Android Kotlin Golden Vector Parity (spec/vectors.json)
+
+6. Record your 2:50 YouTube demo using docs/DEMO_SCRIPT_2M50S.md and submit on Devpost:
+   https://devpost.com/software/airlockai
+   (Copy-paste description ready in docs/DEVPOST_SUBMISSION.md)

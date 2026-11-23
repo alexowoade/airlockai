@@ -1,0 +1,23 @@
+{
+  "manifest_version": 3,
+  "name": "AirlockAI Side Panel",
+  "version": "1.0.0",
+  "description": "Zero-leakage hybrid document airlock: scrub PII on-device with Gemini Nano before cloud auditing.",
+  "permissions": [
+    "sidePanel",
+    "activeTab",
+    "scripting",
+    "contextMenus",
+    "storage"
+  ],
+  "action": {
+    "default_title": "Open AirlockAI Side Panel"
+  },
+  "side_panel": {
+    "default_path": "sidepanel.html"
+  },
+  "background": {
+    "service_worker": "background.js",
+    "type": "module"
+  }
+}

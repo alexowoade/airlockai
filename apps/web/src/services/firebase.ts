@@ -1,0 +1,275 @@
+import { initializeApp, type FirebaseApp } from "firebase/app";
+import { initializeAppCheck, ReCaptchaEnterpriseProvider } from "firebase/app-check";
+import { getAuth, signInAnonymously, type Auth } from "firebase/auth";
+import {
+  addDoc,
+  collection,
+  getDocs,
+  getFirestore,
+  limit,
+  orderBy,
+  query,
+  type Firestore,
+} from "firebase/firestore";
+import { fetchAndActivate, getRemoteConfig, getValue, type RemoteConfig } from "firebase/remote-config";
+import {
+  getAI,
+  getGenerativeModel,
+  getTemplateGenerativeModel,
+  GoogleAIBackend,
+  InferenceMode,
+  Schema,
+  type AI,
+  type GenerativeModel,
+  type TemplateGenerativeModel,
+} from "firebase/ai";
+import type { AirlockReceipt, PolicyProfile } from "@airlock/core";
+
+export interface AirlockPolicyConfig {
+  readonly profile: PolicyProfile;
+  readonly templateId: string;
+  readonly blockOnMediumConfidence: boolean;
+  readonly maxCloudTokens: number;
+}
+
+export const DEFAULT_POLICY: AirlockPolicyConfig = {
+  profile: "NDA_STRICT",
+  templateId: "airlock-nda-v1-0-0",
+  blockOnMediumConfidence: true,
+  maxCloudTokens: 1200,
+};
+
+export const POLICY_TEMPLATES: Record<PolicyProfile, string> = {
+  NDA_STRICT: "airlock-nda-v1-0-0",
+  MEDICAL_HIPAA: "airlock-hipaa-v1-0-0",
+  INVOICE_FINANCE: "airlock-invoice-v1-0-0",
+};
+
+const firebaseConfig = {
+  apiKey: import.meta.env.VITE_FIREBASE_API_KEY as string | undefined,
+  authDomain: import.meta.env.VITE_FIREBASE_AUTH_DOMAIN as string | undefined,
+  projectId: import.meta.env.VITE_FIREBASE_PROJECT_ID as string | undefined,
+  storageBucket: import.meta.env.VITE_FIREBASE_STORAGE_BUCKET as string | undefined,
+  messagingSenderId: import.meta.env.VITE_FIREBASE_MESSAGING_SENDER_ID as string | undefined,
+  appId: import.meta.env.VITE_FIREBASE_APP_ID as string | undefined,
+};
+
+export const isFirebaseConfigured = Boolean(
+  firebaseConfig.apiKey && firebaseConfig.projectId && firebaseConfig.appId
+);
+
+/**
+ * Structured schema shared for Gate 2 semantic + multimodal on-device PII extraction.
+ */
+const semanticPiiSchema = Schema.object({
+  properties: {
+    extractedText: Schema.string({
+      description: "Full plain-text transcription if an image was supplied; otherwise empty string.",
+    }),
+    entities: Schema.array({
+      items: Schema.object({
+        properties: {
+          text: Schema.string({ description: "Exact sensitive substring to redact." }),
+          category: Schema.enumString({
+            enum: ["PERSON", "ORG", "MEDICAL", "SECRET_TERM"],
+          }),
+        },
+      }),
+    }),
+  },
+});
+
+/**
+ * Structured schema shared between on-device Nano and cloud fallback for offline triage.
+ */
+const triageSchema = Schema.object({
+  properties: {
+    documentType: Schema.enumString({ enum: ["NDA", "MEDICAL_BILL", "INVOICE", "CONTRACT", "OTHER"] }),
+    quickRiskLevel: Schema.enumString({ enum: ["LOW", "MEDIUM", "HIGH", "CRITICAL"] }),
+    oneLineSummary: Schema.string({
+      description: "One-sentence summary using ONLY the redacted placeholder tokens.",
+    }),
+  },
+});
+
+export interface FirebaseHandles {
+  app: FirebaseApp;
+  auth: Auth;
+  db: Firestore;
+  remoteConfig: RemoteConfig;
+  ai: AI;
+  localPiiModel: GenerativeModel;
+  hybridTriageModel: GenerativeModel;
+  templateAuditModel: TemplateGenerativeModel;
+  cloudAuditFallbackModel: GenerativeModel;
+}
+
+let cachedHandles: FirebaseHandles | null = null;
+
+export function getFirebaseHandles(): FirebaseHandles | null {
+  if (!isFirebaseConfigured) return null;
+  if (cachedHandles) return cachedHandles;
+
+  const app = initializeApp(firebaseConfig);
+
+  if (import.meta.env.DEV) {
+    (self as unknown as Record<string, unknown>).FIREBASE_APPCHECK_DEBUG_TOKEN = true;
+  }
+
+  initializeAppCheck(app, {
+    provider: new ReCaptchaEnterpriseProvider(
+      (import.meta.env.VITE_RECAPTCHA_SITE_KEY as string | undefined) || "dev-placeholder"
+    ),
+    isTokenAutoRefreshEnabled: true,
+  });
+
+  const auth = getAuth(app);
+  const db = getFirestore(app);
+  const remoteConfig = getRemoteConfig(app);
+  remoteConfig.settings.minimumFetchIntervalMillis = import.meta.env.DEV ? 10_000 : 300_000;
+  remoteConfig.defaultConfig = {
+    airlock_policy: JSON.stringify(DEFAULT_POLICY),
+  };
+
+  const ai = getAI(app, { backend: new GoogleAIBackend() });
+
+  // 1. Gate 2: STRICTLY ON-DEVICE (Guarded additionally by #10635 runtime check below)
+  const localPiiModel = getGenerativeModel(ai, {
+    mode: InferenceMode.ONLY_ON_DEVICE,
+    onDeviceParams: {
+      promptOptions: { responseConstraint: semanticPiiSchema },
+    },
+  });
+
+  // 2. Offline Triage: PREFER_ON_DEVICE with structured output on BOTH paths
+  const hybridTriageModel = getGenerativeModel(ai, {
+    mode: InferenceMode.PREFER_ON_DEVICE,
+    onDeviceParams: {
+      promptOptions: { responseConstraint: triageSchema },
+    },
+    inCloudParams: {
+      model: "gemini-3.5-flash-lite",
+      generationConfig: {
+        responseMimeType: "application/json",
+        responseSchema: triageSchema,
+      },
+    },
+  });
+
+  // 3. Deep Cloud Audit via locked Server Prompt Templates
+  const templateAuditModel = getTemplateGenerativeModel(ai);
+
+  // 4. Fallback Cloud Audit model (ONLY_IN_CLOUD) if server templates are not yet created
+  const cloudAuditFallbackModel = getGenerativeModel(ai, {
+    mode: InferenceMode.ONLY_IN_CLOUD,
+    inCloudParams: {
+      model: "gemini-3.5-flash-lite",
+    },
+  });
+
+  cachedHandles = {
+    app,
+    auth,
+    db,
+    remoteConfig,
+    ai,
+    localPiiModel,
+    hybridTriageModel,
+    templateAuditModel,
+    cloudAuditFallbackModel,
+  };
+  return cachedHandles;
+}
+
+export type LocalNanoStatus = "available" | "downloadable" | "downloading" | "unavailable";
+
+interface BrowserLanguageModelApi {
+  availability: () => Promise<LocalNanoStatus>;
+  create: (opts?: {
+    monitor?: (m: EventTarget) => void;
+  }) => Promise<{ destroy?: () => void }>;
+}
+
+function getBrowserLanguageModel(): BrowserLanguageModelApi | null {
+  const api = (globalThis as unknown as { LanguageModel?: BrowserLanguageModelApi }).LanguageModel;
+  return api ?? null;
+}
+
+/**
+ * Defense against firebase-js-sdk#10635:
+ * Verifies Chrome's native LanguageModel is genuinely present and "available"
+ * BEFORE invoking Firebase's ONLY_ON_DEVICE mode, preventing accidental cloud fallback.
+ */
+export async function checkLocalNanoStatus(): Promise<LocalNanoStatus> {
+  const api = getBrowserLanguageModel();
+  if (!api) return "unavailable";
+  try {
+    return await api.availability();
+  } catch {
+    return "unavailable";
+  }
+}
+
+export async function triggerLocalNanoDownload(
+  onProgress: (pct: number) => void
+): Promise<LocalNanoStatus> {
+  const api = getBrowserLanguageModel();
+  if (!api) return "unavailable";
+  const session = await api.create({
+    monitor(m) {
+      m.addEventListener("downloadprogress", (ev: Event) => {
+        const loaded = (ev as Event & { loaded?: number }).loaded ?? 0;
+        onProgress(Math.round(loaded * 100));
+      });
+    },
+  });
+  session.destroy?.();
+  return checkLocalNanoStatus();
+}
+
+export async function fetchRemotePolicy(): Promise<AirlockPolicyConfig> {
+  const handles = getFirebaseHandles();
+  if (!handles) return DEFAULT_POLICY;
+  try {
+    await fetchAndActivate(handles.remoteConfig);
+    const raw = getValue(handles.remoteConfig, "airlock_policy").asString();
+    return JSON.parse(raw) as AirlockPolicyConfig;
+  } catch {
+    return DEFAULT_POLICY;
+  }
+}
+
+export interface LedgerEntry extends AirlockReceipt {
+  readonly inferenceSource: "ON_DEVICE" | "IN_CLOUD";
+  readonly riskLevel: string;
+  readonly sanitizedSummary: string;
+}
+
+export async function writeZeroPiiAuditLedger(entry: LedgerEntry): Promise<string | null> {
+  const handles = getFirebaseHandles();
+  if (!handles) return null;
+  if (!handles.auth.currentUser) {
+    await signInAnonymously(handles.auth);
+  }
+  const uid = handles.auth.currentUser!.uid;
+  const ref = await addDoc(collection(handles.db, "users", uid, "audit_ledger"), {
+    ...entry,
+  });
+  return ref.id;
+}
+
+export async function fetchZeroPiiAuditLedger(): Promise<ReadonlyArray<LedgerEntry>> {
+  const handles = getFirebaseHandles();
+  if (!handles) return [];
+  if (!handles.auth.currentUser) {
+    await signInAnonymously(handles.auth);
+  }
+  const uid = handles.auth.currentUser!.uid;
+  const q = query(
+    collection(handles.db, "users", uid, "audit_ledger"),
+    orderBy("timestampIso", "desc"),
+    limit(15)
+  );
+  const snap = await getDocs(q);
+  return snap.docs.map((d) => d.data() as LedgerEntry);
+}

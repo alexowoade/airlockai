@@ -1,0 +1,14 @@
+{
+  "name": "airlockai-monorepo",
+  "private": true,
+  "workspaces": [
+    "packages/*",
+    "apps/web",
+    "apps/extension"
+  ],
+  "scripts": {
+    "test:core": "npm test --workspace=@airlock/core",
+    "build:core": "npm run build --workspace=@airlock/core",
+    "build:extension": "npm run build --workspace=@airlock/extension"
+  }
+}

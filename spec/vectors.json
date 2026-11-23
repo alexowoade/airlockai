@@ -1,0 +1,95 @@
+{
+  "protocolVersion": "airlock.v1",
+  "sha256SelfCheck": {
+    "input": "abc",
+    "expectedHex": "ba7816bf8f01cfea414140de5dae2223b00361a396177a9cb410ff61f20015ad"
+  },
+  "cleanVectors": [
+    {
+      "id": "nda-structured-and-semantic",
+      "policyProfile": "NDA_STRICT",
+      "rawDoc": "Mutual NDA between Helios Robotics and Elena Vance (elena.vance@helios.test, SSN 912-45-6789, API key sk-live-9f8a7b6c5d4e3f2a1b0c9d8e7f, cap $45,000.00 on 2026-11-15).",
+      "simulatedGate2Spans": [
+        {
+          "text": "Helios Robotics",
+          "category": "ORG"
+        },
+        {
+          "text": "Elena Vance",
+          "category": "PERSON"
+        }
+      ],
+      "expectedSanitized": "Mutual NDA between [ORG_1] and [PERSON_1] ([EMAIL_1], SSN [SSN_1], API key [API_SECRET_1], cap [CURRENCY_1] on [DATE_1]).",
+      "expectedRedactedCount": 7
+    },
+    {
+      "id": "invoice-luhn-valid-vs-invalid",
+      "policyProfile": "INVOICE_FINANCE",
+      "rawDoc": "Wire $84,750.00 to IBAN DE89370400440532013000 or card 4532-0151-1283-0366. Ref order 1234-5678-9012-3457, phone +1-212-555-0194.",
+      "simulatedGate2Spans": [],
+      "expectedSanitized": "Wire [CURRENCY_1] to IBAN [IBAN_1] or card [CARD_OR_ACCOUNT_1]. Ref order 1234-5678-9012-3457, phone [PHONE_1].",
+      "expectedRedactedCount": 4
+    },
+    {
+      "id": "hipaa-medical-record",
+      "policyProfile": "MEDICAL_HIPAA",
+      "rawDoc": "Patient Clara Lindqvist (clara.lindqvist@mail.test, SSN 901-33-4482) diagnosed with Stage II Thyroid Carcinoma. Balance $18,050.00.",
+      "simulatedGate2Spans": [
+        {
+          "text": "Clara Lindqvist",
+          "category": "PERSON"
+        },
+        {
+          "text": "Stage II Thyroid Carcinoma",
+          "category": "MEDICAL"
+        }
+      ],
+      "expectedSanitized": "Patient [PERSON_1] ([EMAIL_1], SSN [SSN_1]) diagnosed with [MEDICAL_1]. Balance [CURRENCY_1].",
+      "expectedRedactedCount": 5
+    }
+  ],
+  "adversarialVectors": [
+    {
+      "id": "v1-exact-escape",
+      "secret": "912-45-6789",
+      "category": "SSN",
+      "poisonedSuffix": " LEAK: 912-45-6789",
+      "expectedVector": "EXACT_OR_CASE_INSENSITIVE"
+    },
+    {
+      "id": "v2-collapsed-alnum",
+      "secret": "912-45-6789",
+      "category": "SSN",
+      "poisonedSuffix": " LEAK: 912456789",
+      "expectedVector": "COLLAPSED_ALPHANUMERIC"
+    },
+    {
+      "id": "v3-partial-surname",
+      "secret": "Elena Vance",
+      "category": "PERSON",
+      "poisonedSuffix": " Note: Vance rejected clause 4.",
+      "expectedVector": "PARTIAL_TOKEN_OR_SURNAME"
+    },
+    {
+      "id": "v4-base64-exfil",
+      "secret": "elena.vance@helios.test",
+      "category": "EMAIL",
+      "poisonedSuffix": " EXFIL: ZWxlbmEudmFuY2VAaGVsaW9zLnRlc3Q=",
+      "expectedVector": "ENCODED_EXFILTRATION"
+    },
+    {
+      "id": "v5-zero-width-smuggle",
+      "secret": "912-45-6789",
+      "category": "SSN",
+      "poisonedSuffix": " ZWSP: 9​1​2​-​4​5​-​6​7​8​9",
+      "expectedVector": "UNICODE_NFKC_OR_ZERO_WIDTH"
+    },
+    {
+      "id": "v6-canary-injection",
+      "secret": "AIRLOCK-CANARY-FIXED001",
+      "category": "CANARY",
+      "poisonedSuffix": " ECHO: AIRLOCK-CANARY-FIXED001",
+      "expectedVector": "CANARY_TRAP"
+    }
+  ]
+}

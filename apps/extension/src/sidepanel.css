@@ -1,0 +1,69 @@
+:root {
+  color-scheme: dark;
+  --bg: #070b14;
+  --panel: #0f172a;
+  --border: #1e293b;
+  --text: #e2e8f0;
+  --muted: #94a3b8;
+}
+
+* { box-sizing: border-box; }
+body {
+  margin: 0;
+  font-family: Inter, system-ui, -apple-system, sans-serif;
+  background: var(--bg);
+  color: var(--text);
+  font-size: 13px;
+}
+
+.sp-wrap { padding: 12px; display: flex; flex-direction: column; gap: 10px; }
+.sp-header {
+  display: flex; align-items: center; justify-content: space-between;
+  padding-bottom: 8px; border-bottom: 1px solid var(--border);
+}
+.sp-title { display: flex; align-items: center; gap: 8px; font-weight: 700; font-size: 14px; }
+.sp-card {
+  background: var(--panel); border: 1px solid var(--border); border-radius: 10px;
+  padding: 10px; display: flex; flex-direction: column; gap: 8px;
+}
+.sp-row { display: flex; flex-wrap: wrap; gap: 6px; align-items: center; }
+.sp-badge {
+  display: inline-flex; align-items: center; gap: 4px; padding: 3px 8px;
+  border-radius: 999px; font-size: 11px; font-weight: 600;
+  border: 1px solid var(--border); background: #0b1220;
+}
+.sp-badge.green { border-color: #065f46; color: #34d399; background: #022c22; }
+.sp-badge.amber { border-color: #78350f; color: #fbbf24; background: #271504; }
+.sp-badge.red { border-color: #7f1d1d; color: #f87171; background: #2b0b0e; }
+
+textarea {
+  width: 100%; min-height: 110px; background: #060a12; color: var(--text);
+  border: 1px solid var(--border); border-radius: 8px; padding: 8px;
+  font-family: ui-monospace, SFMono-Regular, Menlo, monospace; font-size: 12px; resize: vertical;
+}
+button {
+  display: inline-flex; align-items: center; gap: 5px; padding: 6px 10px;
+  border-radius: 7px; border: 1px solid var(--border); background: #131f38;
+  color: var(--text); font-weight: 600; font-size: 12px; cursor: pointer;
+}
+button:hover:not(:disabled) { background: #1e293b; }
+button:disabled { opacity: 0.5; cursor: not-allowed; }
+button.primary { background: #059669; border-color: #10b981; color: #fff; }
+button.cloud { background: #0284c7; border-color: #38bdf8; color: #fff; }
+button.danger { background: #7f1d1d; border-color: #ef4444; color: #fecaca; }
+
+.sp-box {
+  background: #060a12; border: 1px solid var(--border); border-radius: 8px;
+  padding: 8px; font-family: ui-monospace, SFMono-Regular, Menlo, monospace;
+  font-size: 11.5px; white-space: pre-wrap; word-break: break-word;
+  max-height: 200px; overflow-y: auto;
+}
+.sp-alert-red {
+  border: 1px solid #ef4444; background: #2b0b0e; color: #fecaca;
+  padding: 8px; border-radius: 8px; font-size: 11.5px;
+}
+.sp-alert-green {
+  border: 1px solid #10b981; background: #022c22; color: #a7f3d0;
+  padding: 8px; border-radius: 8px; font-size: 11.5px;
+}
+.muted { color: var(--muted); font-size: 11.5px; }

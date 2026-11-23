@@ -1,0 +1,37 @@
+rules_version = '2';
+service cloud.firestore {
+  match /databases/{database}/documents {
+    function hasNoRawPii(text) {
+      return !(text.matches('.*[A-Za-z0-9._%+-]+@[A-Za-z0-9.-]+\\.[A-Za-z]{2,}.*'))
+          && !(text.matches('.*\\b[0-9]{3}-[0-9]{2}-[0-9]{4}\\b.*'))
+          && !(text.matches('.*\\b([0-9]{4}[- ]?){3}[0-9]{4}\\b.*'));
+    }
+
+    match /users/{userId}/audit_ledger/{receiptId} {
+      allow read: if request.auth != null && request.auth.uid == userId;
+      allow create: if request.auth != null
+        && request.auth.uid == userId
+        && request.resource.data.keys().hasOnly([
+          'receiptVersion',
+          'rawDocSha256',
+          'sanitizedPayloadSha256',
+          'prevReceiptSha256',
+          'receiptSha256',
+          'redactedCount',
+          'checksPassed',
+          'firewallPassed',
+          'policyProfile',
+          'inferenceSource',
+          'riskLevel',
+          'sanitizedSummary',
+          'timestampIso'
+        ])
+        && request.resource.data.firewallPassed == true
+        && request.resource.data.checksPassed == 6
+        && request.resource.data.rawDocSha256.size() == 64
+        && request.resource.data.receiptSha256.size() == 64
+        && hasNoRawPii(request.resource.data.sanitizedSummary);
+      allow update, delete: if false; // Append-only tamper-evident audit ledger
+    }
+  }
+}

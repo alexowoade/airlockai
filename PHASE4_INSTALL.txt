@@ -1,0 +1,19 @@
+AirlockAI — Phase 4 Installation & Verification
+===============================================
+
+1. Extract directly into the root of your existing `airlockai/` monorepo:
+   unzip -o airlockai-phase4.zip -d /path/to/airlockai
+
+2. Verify TypeScript Golden Vector Parity + 1,000-run fast-check proofs (14 tests total):
+   cd /path/to/airlockai
+   npm run build:core
+   npm run test:core
+
+3. Verify Native Android Kotlin Golden Vector Parity (Java 17 + Android SDK / Gradle):
+   cd /path/to/airlockai/apps/android
+   gradle testDebugUnitTest
+
+4. Optional live Android Firebase connection:
+   - Register Android app `com.airlockai.app` in Firebase Console
+   - Download `google-services.json` into `apps/android/app/google-services.json` (git-ignored)
+   - Copy the printed DebugAppCheckProvider secret from Logcat into Firebase Console -> App Check -> Manage debug tokens
