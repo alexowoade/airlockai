@@ -46,6 +46,14 @@
       ],
       "expectedSanitized": "Patient [PERSON_1] ([EMAIL_1], SSN [SSN_1]) diagnosed with [MEDICAL_1]. Balance [CURRENCY_1].",
       "expectedRedactedCount": 5
+    },
+    {
+      "id": "nda-offline-ner-no-nano",
+      "policyProfile": "NDA_STRICT",
+      "rawDoc": "Between Helios Robotics Corp and Apex Foundry LLC relating to Project Obsidian. Lead Engineer Marcus Sterling (SSN 912-45-6789) reviewed Facility: Northstar Oncology & Imaging Center.",
+      "simulatedGate2Spans": [],
+      "expectedSanitized": "Between [ORG_1] and [ORG_2] relating to [SECRET_TERM_1]. Lead Engineer [PERSON_1] (SSN [SSN_1]) reviewed Facility: [ORG_3].",
+      "expectedRedactedCount": 6
     }
   ],
   "adversarialVectors": [
@@ -81,7 +89,7 @@
       "id": "v5-zero-width-smuggle",
       "secret": "912-45-6789",
       "category": "SSN",
-      "poisonedSuffix": " ZWSP: 9​1​2​-​4​5​-​6​7​8​9",
+      "poisonedSuffix": " ZWSP: 912-\u200b45-6789",
       "expectedVector": "UNICODE_NFKC_OR_ZERO_WIDTH"
     },
     {

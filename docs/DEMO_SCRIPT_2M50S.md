@@ -48,7 +48,7 @@
 ### 2:05 – 2:35 | Multi-Platform Proof: Chrome Side Panel + Android Kotlin Parity (30s)
 - **Action:**
   1. Switch to your second Chrome tab, highlight a sensitive paragraph, right-click **AirlockAI: Scrub & Audit Selection**, and click **Run 3-Gate Local Airlock (0B Sent)** inside the MV3 Side Panel.
-  2. Switch to your terminal (or GitHub Actions CI tab) and run `npm run test:core` showing **14/14 passing** (10 shared `spec/vectors.json` golden vectors + 1,000-run `fast-check` zero-leak proof) alongside the Kotlin Android JUnit parity suite.
+  2. Switch to your terminal (or GitHub Actions CI tab) and run `npm run test:core` showing **16/16 passing** (11 shared `spec/vectors.json` golden vectors + 1,000-run `fast-check` zero-leak proof) alongside the Kotlin Android JUnit parity suite.
 - **Voiceover:**
   > "The exact same `@airlock/core` engine powers our Manifest V3 Chrome Side Panel so users can scrub live emails or contracts in place. And our native Kotlin Android app implements the same protocol using `firebase-ai-ondevice` with `OnDeviceModelOption.PREVIEW` and the same Firestore ledger. Both TypeScript and Kotlin run against one shared `spec/vectors.json` suite, backed by 1,000 randomized `fast-check` fuzzing proofs."
 

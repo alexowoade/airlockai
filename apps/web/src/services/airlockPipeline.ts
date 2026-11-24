@@ -82,7 +82,7 @@ function findAllOccurrences(
 }
 
 /**
- * Runs Gate 1 (Deterministic) -> Guarded Gate 2 (ONLY_ON_DEVICE Nano) -> Gate 3 (6-Vector Firewall).
+ * Runs Gate 1 (Deterministic PII + NER) -> Guarded Gate 2 (ONLY_ON_DEVICE Nano) -> Gate 3 (6-Vector Firewall).
  * Accepts raw text and/or an inline PNG/JPEG image (raw image NEVER leaves the device).
  */
 export async function runLocalAirlock(params: {
@@ -145,7 +145,7 @@ export async function runLocalAirlock(params: {
         inferenceSource: "DETERMINISTIC_LOCAL",
         latencyMs: Math.round(performance.now() - t0),
         bytesSent: 0,
-        payloadPreview: `Nano local scan skipped (${err instanceof Error ? err.message : "unavailable"}). Protected by Gate 1 + #10635 guard.`,
+        payloadPreview: `Nano local scan skipped (${err instanceof Error ? err.message : "unavailable"}). Protected by Gate 1 deterministic NER + #10635 guard.`,
       });
     }
   } else {
@@ -154,20 +154,21 @@ export async function runLocalAirlock(params: {
       inferenceSource: "DETERMINISTIC_LOCAL",
       latencyMs: 1,
       bytesSent: 0,
-      payloadPreview: `SDK #10635 Guard Active (Nano status: ${nanoStatus}). Hard-blocked cloud fallback for raw document; running local Gate 1 only.`,
+      payloadPreview: `SDK #10635 Guard Active (Nano status: ${nanoStatus}). Hard-blocked raw cloud fallback; Gate 1 deterministic PII + NER fallback active (0B sent).`,
     });
   }
 
-  // Gate 1: Deterministic Regex + Luhn + Shannon Entropy (< 5ms)
+  // Gate 1: Deterministic Regex + Luhn + Shannon Entropy + Named-Entity Rules (< 5ms)
   const g1Start = performance.now();
   const rawDoc = asRawDocument(workingText);
   const gate1Spans = scanDeterministicPii(rawDoc);
+  const uniqueCategories = Array.from(new Set(gate1Spans.map((s) => s.category))).join(", ");
   wireTap.record({
     stage: "GATE1_REGEX",
     inferenceSource: "DETERMINISTIC_LOCAL",
     latencyMs: Math.max(1, Math.round(performance.now() - g1Start)),
     bytesSent: 0,
-    payloadPreview: `Deterministic scanner matched ${gate1Spans.length} structured PII/secret spans locally.`,
+    payloadPreview: `Deterministic scanner matched ${gate1Spans.length} local spans (${uniqueCategories || "none"}).`,
   });
 
   const mergedSpans = resolveOverlappingSpans([...gate1Spans, ...gate2Spans]);

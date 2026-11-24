@@ -14,6 +14,14 @@ enum class RedTeamAttackType {
 }
 
 object Gate3Firewall {
+    private val genericPartialWords = setOf(
+        "associates", "capital", "center", "clinic", "codename", "corporation",
+        "diagnostics", "enterprises", "foundry", "group", "health", "healthcare",
+        "holdings", "hospital", "imaging", "industries", "limited", "logistics",
+        "medical", "oncology", "operation", "partners", "project", "robotics",
+        "solutions", "systems", "technologies", "ventures",
+    )
+
     private val zeroWidthRegex = Regex("[\u200B-\u200D\u2060\uFEFF]")
     private val nonAlnumRegex = Regex("[^a-zA-Z0-9]")
 
@@ -127,8 +135,11 @@ object Gate3Firewall {
                 entry.category == EntityCategory.ORG ||
                 entry.category == EntityCategory.SECRET_TERM
             ) {
-                val parts = secret.split(Regex("\\s+")).filter { it.length >= 5 }
-                if (parts.size >= 2) {
+                val allWords = secret.split(Regex("\\s+"))
+                val parts = allWords.filter {
+                    it.length >= 5 && it.lowercase() !in genericPartialWords
+                }
+                if (allWords.size >= 2 && parts.isNotEmpty()) {
                     val leakedPart = parts.firstOrNull { part ->
                         Regex("\\b${Regex.escape(part)}\\b", RegexOption.IGNORE_CASE)
                             .containsMatchIn(candidateSanitized)

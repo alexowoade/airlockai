@@ -6,8 +6,63 @@ object Gate1Regex {
     private data class PatternRule(
         val category: EntityCategory,
         val regex: Regex,
+        val captureGroup: Int? = null,
+        val trimOrgLeading: Boolean = false,
         val validate: ((String) -> Boolean)? = null,
     )
+
+    private val orgLeadingExcluded = setOf(
+        "a", "against", "an", "and", "at", "between", "billed", "by", "client",
+        "company", "contact", "discloser", "facility", "for", "from", "in",
+        "into", "of", "on", "or", "party", "per", "recipient", "the", "to",
+        "under", "vendor", "with",
+    )
+
+    private val nonPersonWords = setOf(
+        "agreement", "amendment", "amount", "and", "annex", "annual", "appendix",
+        "article", "assignment", "associates", "authorized", "backup", "balance",
+        "bank", "between", "billed", "billing", "board", "breach", "business",
+        "capital", "carcinoma", "card", "center", "charges", "chief", "clause",
+        "client", "clinic", "code", "codename", "company", "confidential",
+        "consequential", "contact", "contract", "corp", "corporation", "court",
+        "courts", "credit", "damages", "date", "days", "department", "derivative",
+        "diabetes", "diagnosis", "diagnostics", "director", "discloser",
+        "disclosure", "dispute", "disputes", "division", "document", "due",
+        "effective", "email", "employee", "engineer", "enterprises", "executive",
+        "exhibit", "facility", "fee", "file", "final", "finance", "financial",
+        "floor", "follow", "for", "foundry", "from", "full", "general",
+        "governing", "group", "health", "healthcare", "hipaa", "holdings",
+        "hospital", "iban", "imaging", "inc", "indemnity", "industries",
+        "information", "instructions", "insurance", "intellectual", "invoice",
+        "item", "january", "february", "march", "april", "may", "june", "july",
+        "august", "september", "october", "november", "december", "monday",
+        "tuesday", "wednesday", "thursday", "friday", "saturday", "sunday",
+        "jurisdiction", "key", "labs", "late", "law", "lead", "legal", "leukemia",
+        "liability", "license", "licensing", "limited", "llc", "llp", "logistics",
+        "ltd", "lymphoma", "manager", "master", "medical", "melanoma", "mellitus",
+        "mutual", "nda", "net", "network", "new", "non", "note", "notice",
+        "number", "officer", "on", "oncology", "operation", "order", "out",
+        "outpatient", "panel", "partner", "partners", "party", "pathology",
+        "patient", "payment", "penalty", "perpetual", "person", "personnel",
+        "phone", "plan", "policy", "president", "pricing", "primary", "prior",
+        "privacy", "project", "property", "recipient", "record", "ref",
+        "remittance", "report", "representative", "robotics", "sarcoma",
+        "schedule", "schematics", "section", "security", "senior", "service",
+        "services", "settlement", "signer", "solicit", "solutions", "ssn",
+        "stage", "statement", "street", "subject", "summary", "systems", "tax",
+        "technologies", "term", "terms", "the", "thyroid", "to", "total", "type",
+        "unpaid", "updated", "urgent", "vendor", "ventures", "vice", "weekly",
+        "wire", "with", "within",
+    )
+
+    private val leadingWordRegex = Regex("""^([A-Za-z]+)(\s+)""")
+
+    private const val NAME_PART = "(?:[A-Z][a-z]{0,20}[-'][A-Z][a-z]{1,20}|[A-Z][a-z]{1,20})"
+    private const val ORG_SUFFIX_PATTERN =
+        "(?:Corp\\.?|Corporation|Inc\\.?|LLC|LLP|Ltd\\.?|Limited|Group|Holdings|Foundry|" +
+            "Robotics|Labs|Systems|Technologies|Solutions|Partners|Ventures|" +
+            "Bank|Capital|Clinic|Hospital|Medical Center|Center|Health|Healthcare|" +
+            "Diagnostics|Associates|Industries|Enterprises)"
 
     fun passesLuhn(rawDigits: String): Boolean {
         val digits = rawDigits.filter { it.isDigit() }
@@ -39,6 +94,30 @@ object Gate1Regex {
             entropy -= p * (ln(p) / ln2)
         }
         return entropy
+    }
+
+    private fun isValidPersonPhrase(phrase: String): Boolean {
+        val words = phrase.trim().split(Regex("""\s+"""))
+        if (words.size < 2) return false
+        return words.all { it.lowercase() !in nonPersonWords }
+    }
+
+    private fun trimLeadingOrgWords(text: String, start: Int): Triple<Int, Int, String>? {
+        var curText = text
+        var curStart = start
+        while (true) {
+            val m = leadingWordRegex.find(curText) ?: break
+            val word = m.groupValues[1]
+            if (word.lowercase() in orgLeadingExcluded) {
+                val adv = m.value.length
+                curText = curText.substring(adv)
+                curStart += adv
+            } else {
+                break
+            }
+        }
+        if (!curText.contains(' ')) return null
+        return Triple(curStart, curStart + curText.length, curText)
     }
 
     private val rules = listOf(
@@ -85,17 +164,73 @@ object Gate1Regex {
             category = EntityCategory.DATE,
             regex = Regex("""\b(?:\d{4}-\d{2}-\d{2}|\d{2}/\d{2}/\d{4})\b"""),
         ),
+        // Deterministic Named-Entity Fallback Rules (parity with TypeScript Gate 1)
+        PatternRule(
+            category = EntityCategory.ORG,
+            regex = Regex(
+                "\\b[A-Z][A-Za-z0-9'.-]+(?:\\s+(?:&\\s+)?[A-Z][A-Za-z0-9'.-]+){0,4}\\s+$ORG_SUFFIX_PATTERN(?=\\b|[^A-Za-z0-9])"
+            ),
+            trimOrgLeading = true,
+        ),
+        PatternRule(
+            category = EntityCategory.SECRET_TERM,
+            regex = Regex("""\b(?:Project|Operation|Codename)\s+[A-Z][a-zA-Z0-9-]+(?:\s+[A-Z][a-zA-Z0-9-]+)?\b"""),
+        ),
+        PatternRule(
+            category = EntityCategory.MEDICAL,
+            regex = Regex(
+                """\b(?:Stage\s+(?:I{1,3}V?|IV|[1-4])[A-B]?\s+[A-Z][a-zA-Z-]+(?:\s+[A-Z][a-zA-Z-]+){0,3}|Type\s+[12]\s+Diabetes(?:\s+Mellitus)?|(?:[A-Z][a-zA-Z-]+\s+){0,2}(?:Carcinoma|Lymphoma|Leukemia|Melanoma|Sarcoma|Diabetes|Hypertension|Pneumonia|Hepatitis|Asthma|Arthritis|Neuropathy|Sclerosis|Infarction))\b"""
+            ),
+        ),
+        PatternRule(
+            category = EntityCategory.PERSON,
+            regex = Regex("\\b(?:Dr\\.|Mr\\.|Mrs\\.|Ms\\.|Prof\\.)\\s+$NAME_PART(?:\\s+$NAME_PART)?\\b"),
+        ),
+        PatternRule(
+            category = EntityCategory.PERSON,
+            regex = Regex(
+                "\\b(?:Patient|Authorized Signer|Signer|Lead Engineer|Chief Executive Officer|Chief Financial Officer|CEO|CFO|Director|Manager|Contact|Attn|Employee|Physician|Doctor|Counsel)\\s*:?\\s+($NAME_PART\\s+$NAME_PART)\\b"
+            ),
+            captureGroup = 1,
+            validate = ::isValidPersonPhrase,
+        ),
+        PatternRule(
+            category = EntityCategory.PERSON,
+            regex = Regex("\\b$NAME_PART\\s+$NAME_PART\\b"),
+            validate = ::isValidPersonPhrase,
+        ),
     )
 
     fun scanDeterministicPii(rawDoc: RawDocument): List<DetectedSpan> {
         val candidates = mutableListOf<DetectedSpan>()
         for (rule in rules) {
             for (match in rule.regex.findAll(rawDoc.value)) {
-                val text = match.value
+                var start: Int
+                var end: Int
+                var text: String
+
+                val grp = rule.captureGroup?.let { match.groups[it] }
+                if (grp != null) {
+                    start = grp.range.first
+                    end = grp.range.last + 1
+                    text = grp.value
+                } else {
+                    start = match.range.first
+                    end = match.range.last + 1
+                    text = match.value
+                }
+
+                if (rule.trimOrgLeading) {
+                    val trimmed = trimLeadingOrgWords(text, start) ?: continue
+                    start = trimmed.first
+                    end = trimmed.second
+                    text = trimmed.third
+                }
+
                 if (rule.validate == null || rule.validate.invoke(text)) {
                     candidates += DetectedSpan(
-                        start = match.range.first,
-                        end = match.range.last + 1,
+                        start = start,
+                        end = end,
                         text = text,
                         category = rule.category,
                         detectedBy = DetectionSource.GATE1_REGEX,

@@ -10,6 +10,13 @@ import { AirlockVault, bytesToBase64 } from "./vault.js";
 
 const encoder = new TextEncoder();
 const ZERO_WIDTH_REGEX = /[\u200B-\u200D\u2060\uFEFF]/g;
+const GENERIC_PARTIAL_WORDS = new Set([
+  "associates", "capital", "center", "clinic", "codename", "corporation",
+  "diagnostics", "enterprises", "foundry", "group", "health", "healthcare",
+  "holdings", "hospital", "imaging", "industries", "limited", "logistics",
+  "medical", "oncology", "operation", "partners", "project", "robotics",
+  "solutions", "systems", "technologies", "ventures",
+]);
 
 export async function sha256Hex(input: string): Promise<string> {
   const hashBuffer = await globalThis.crypto.subtle.digest("SHA-256", encoder.encode(input));
@@ -132,8 +139,11 @@ export async function verifyAndMintPayload(
 
     // Vector 3: Partial-token / surname or last-6-digits leak
     if (entry.category === "PERSON" || entry.category === "ORG" || entry.category === "SECRET_TERM") {
-      const parts = secret.split(/\s+/).filter((p) => p.length >= 5);
-      if (parts.length >= 2) {
+      const allWords = secret.split(/\s+/);
+      const parts = allWords.filter(
+        (p) => p.length >= 5 && !GENERIC_PARTIAL_WORDS.has(p.toLowerCase())
+      );
+      if (allWords.length >= 2 && parts.length >= 1) {
         const leakedPart = parts.find((part) => {
           const rx = new RegExp(`\\b${escapeRegExp(part)}\\b`, "i");
           return rx.test(candidateSanitized);

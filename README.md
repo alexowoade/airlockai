@@ -4,7 +4,7 @@
 
 [![License](https://img.shields.io/badge/License-Apache_2.0-blue.svg)](./LICENSE)
 [![Live Demo](https://img.shields.io/badge/Live_Demo-Firebase_Hosting-10b981.svg)](https://airlockai-2026-alex.web.app)
-[![Core Proofs](https://img.shields.io/badge/Zero--Leak_Proofs-14%2F14_Vitest_+_1000_fast--check-0284c7.svg)](./packages/core/src/firewall.test.ts)
+[![Core Proofs](https://img.shields.io/badge/Zero--Leak_Proofs-16%2F16_Vitest_+_1000_fast--check-0284c7.svg)](./packages/core/src/firewall.test.ts)
 
 AirlockAI is a multi-platform hybrid AI security appliance built for **#BuildHybridAI 2026**. It lets professionals audit sensitive NDAs, HIPAA medical bills, and vendor wire invoices using cloud Gemini reasoning **without raw PII, secrets, or document pixels ever leaving the user's device**.
 
@@ -40,7 +40,7 @@ flowchart LR
 1. **Layer 1: Compile-Time Branded Boundary (TypeScript & Kotlin)**
    - In TypeScript (`RawDocument` vs `VerifiedSanitizedPayload` in `packages/core/src/types.ts`) and Kotlin (`@JvmInline value class RawDocument` vs `internal constructor` `VerifiedSanitizedPayload` in `apps/android/.../AirlockTypes.kt`), cloud inference adapters **refuse to compile** if passed unverified text.
 2. **Layer 2: Dual-Gate On-Device Scanner + SDK `#10635` Guard**
-   - **Gate 1 (Deterministic, < 5 ms):** Algorithmic Luhn validation for 13-19 digit cards, Shannon-entropy secret scanning (>= 4.0 bits/char plus `sk-`, `AIza`, `ghp_` prefixes), IBAN, SSN, email, phone, currency, and dates.
+   - **Gate 1 (Deterministic, < 5 ms):** Algorithmic Luhn validation for 13-19 digit cards, Shannon-entropy secret scanning (>= 4.0 bits/char plus `sk-`, `AIza`, `ghp_` prefixes), IBAN, SSN, email, phone, currency, dates, and deterministic NER fallback (`PERSON`, `ORG`, `MEDICAL`, `SECRET_TERM`) for non-Nano browsers.
    - **Gate 2 (`InferenceMode.ONLY_ON_DEVICE`):** Gemini Nano extracts contextual entities (`PERSON`, `ORG`, `MEDICAL`, `SECRET_TERM`) and transcribes local PNG/JPEG/Bitmap images strictly on-device.
    - **Pre-SDK `#10635` Runtime Guard:** Before invoking Firebase JS SDK `ONLY_ON_DEVICE`, AirlockAI verifies `LanguageModel.availability() === "available"` directly so unsupported browsers can never silently fall back to cloud endpoints with raw PII.
    - **Local Canvas Pixel Redaction:** Document images receive black redaction overlays locally on HTML5 Canvas; raw pixels never cross the wire.
@@ -98,7 +98,7 @@ npm install
 npm run build:core
 npm run test:core
 ```
-Expected result: **14/14 Vitest tests passing** (10 cross-platform `spec/vectors.json` parity checks + 4 security suite tests including the **1,000-run `fast-check`** zero-leak property proof).
+Expected result: **16/16 Vitest tests passing** (11 cross-platform `spec/vectors.json` parity checks + 5 security suite tests including the **1,000-run `fast-check`** zero-leak property proof).
 
 ### 2. Run the Web PWA Locally
 ```bash

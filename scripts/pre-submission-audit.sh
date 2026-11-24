@@ -48,15 +48,15 @@ else
 fi
 
 # 5. Shared cross-platform spec/vectors.json validation
-if python3 -c 'import json; d=json.load(open("spec/vectors.json")); assert d["protocolVersion"]=="airlock.v1" and len(d["cleanVectors"])==3 and len(d["adversarialVectors"])==6' 2>/dev/null; then
-  ok "spec/vectors.json valid (airlock.v1: 3 clean + 6 adversarial golden vectors)"
+if python3 -c 'import json; d=json.load(open("spec/vectors.json")); assert d["protocolVersion"]=="airlock.v1" and len(d["cleanVectors"])==4 and len(d["adversarialVectors"])==6' 2>/dev/null; then
+  ok "spec/vectors.json valid (airlock.v1: 4 clean + 6 adversarial golden vectors)"
 else
   fail "spec/vectors.json invalid or missing"
 fi
 
-# 6. Core type-check + 14/14 proofs
+# 6. Core type-check + 16/16 proofs
 if npm run build:core >/dev/null 2>&1 && npm run test:core >/dev/null 2>&1; then
-  ok "@airlock/core type-check + 14/14 Vitest & 1,000-run fast-check proofs passed"
+  ok "@airlock/core type-check + 16/16 Vitest & 1,000-run fast-check proofs passed"
 else
   fail "@airlock/core build or test suite failed"
 fi

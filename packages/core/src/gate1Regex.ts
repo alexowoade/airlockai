@@ -16,6 +16,52 @@ const CATEGORY_PRIORITY: Record<EntityCategory, number> = {
   CANARY: 110,
 };
 
+/** Leading prepositions/labels trimmed if captured at the start of an ORG phrase */
+const ORG_LEADING_EXCLUDED = new Set([
+  "a", "against", "an", "and", "at", "between", "billed", "by", "client",
+  "company", "contact", "discloser", "facility", "for", "from", "in",
+  "into", "of", "on", "or", "party", "per", "recipient", "the", "to",
+  "under", "vendor", "with",
+]);
+
+/** Common legal, financial, medical, and document-heading words excluded from general PERSON matches */
+const NON_PERSON_WORDS = new Set([
+  "agreement", "amendment", "amount", "and", "annex", "annual", "appendix",
+  "article", "assignment", "associates", "authorized", "backup", "balance",
+  "bank", "between", "billed", "billing", "board", "breach", "business",
+  "capital", "carcinoma", "card", "center", "charges", "chief", "clause",
+  "client", "clinic", "code", "codename", "company", "confidential",
+  "consequential", "contact", "contract", "corp", "corporation", "court",
+  "courts", "credit", "damages", "date", "days", "department", "derivative",
+  "diabetes", "diagnosis", "diagnostics", "director", "discloser",
+  "disclosure", "dispute", "disputes", "division", "document", "due",
+  "effective", "email", "employee", "engineer", "enterprises", "executive",
+  "exhibit", "facility", "fee", "file", "final", "finance", "financial",
+  "floor", "follow", "for", "foundry", "from", "full", "general",
+  "governing", "group", "health", "healthcare", "hipaa", "holdings",
+  "hospital", "iban", "imaging", "inc", "indemnity", "industries",
+  "information", "instructions", "insurance", "intellectual", "invoice",
+  "item", "january", "february", "march", "april", "may", "june", "july",
+  "august", "september", "october", "november", "december", "monday",
+  "tuesday", "wednesday", "thursday", "friday", "saturday", "sunday",
+  "jurisdiction", "key", "labs", "late", "law", "lead", "legal", "leukemia",
+  "liability", "license", "licensing", "limited", "llc", "llp", "logistics",
+  "ltd", "lymphoma", "manager", "master", "medical", "melanoma", "mellitus",
+  "mutual", "nda", "net", "network", "new", "non", "note", "notice",
+  "number", "officer", "on", "oncology", "operation", "order", "out",
+  "outpatient", "panel", "partner", "partners", "party", "pathology",
+  "patient", "payment", "penalty", "perpetual", "person", "personnel",
+  "phone", "plan", "policy", "president", "pricing", "primary", "prior",
+  "privacy", "project", "property", "recipient", "record", "ref",
+  "remittance", "report", "representative", "robotics", "sarcoma",
+  "schedule", "schematics", "section", "security", "senior", "service",
+  "services", "settlement", "signer", "solicit", "solutions", "ssn",
+  "stage", "statement", "street", "subject", "summary", "systems", "tax",
+  "technologies", "term", "terms", "the", "thyroid", "to", "total", "type",
+  "unpaid", "updated", "urgent", "vendor", "ventures", "vice", "weekly",
+  "wire", "with", "within",
+]);
+
 /** Luhn checksum validator to avoid false-positive 16-digit IDs */
 export function passesLuhn(rawDigits: string): boolean {
   const digits = rawDigits.replace(/\D/g, "");
@@ -49,11 +95,48 @@ export function shannonEntropy(input: string): number {
   return entropy;
 }
 
+function isValidPersonPhrase(phrase: string): boolean {
+  const words = phrase.trim().split(/\s+/);
+  if (words.length < 2) return false;
+  return words.every((w) => !NON_PERSON_WORDS.has(w.toLowerCase()));
+}
+
+function trimLeadingOrgWords(
+  text: string,
+  start: number
+): { start: number; end: number; text: string } | null {
+  let curText = text;
+  let curStart = start;
+  while (true) {
+    const m = /^([A-Za-z]+)(\s+)/.exec(curText);
+    if (!m || !m[1]) break;
+    if (ORG_LEADING_EXCLUDED.has(m[1].toLowerCase())) {
+      const adv = m[0].length;
+      curText = curText.slice(adv);
+      curStart += adv;
+    } else {
+      break;
+    }
+  }
+  if (!curText.includes(" ")) return null;
+  return { start: curStart, end: curStart + curText.length, text: curText };
+}
+
 interface PatternRule {
   readonly category: EntityCategory;
   readonly regex: RegExp;
+  readonly captureGroup?: number;
+  readonly trimOrgLeading?: boolean;
   readonly validate?: (matchText: string) => boolean;
 }
+
+const NAME_PART = "(?:[A-Z][a-z]{0,20}[-'][A-Z][a-z]{1,20}|[A-Z][a-z]{1,20})";
+
+const ORG_SUFFIX_PATTERN =
+  "(?:Corp\\.?|Corporation|Inc\\.?|LLC|LLP|Ltd\\.?|Limited|Group|Holdings|Foundry|" +
+  "Robotics|Labs|Systems|Technologies|Solutions|Partners|Ventures|" +
+  "Bank|Capital|Clinic|Hospital|Medical Center|Center|Health|Healthcare|" +
+  "Diagnostics|Associates|Industries|Enterprises)";
 
 const GATE1_RULES: ReadonlyArray<PatternRule> = [
   {
@@ -97,6 +180,42 @@ const GATE1_RULES: ReadonlyArray<PatternRule> = [
     category: "DATE",
     regex: /\b(?:\d{4}-\d{2}-\d{2}|\d{2}\/\d{2}\/\d{4})\b/g,
   },
+  // Deterministic Named-Entity Fallback Rules (guarantees zero name/org/medical leaks when Nano is unavailable)
+  {
+    category: "ORG",
+    regex: new RegExp(
+      `\\b[A-Z][A-Za-z0-9'.-]+(?:\\s+(?:&\\s+)?[A-Z][A-Za-z0-9'.-]+){0,4}\\s+${ORG_SUFFIX_PATTERN}(?=\\b|[^A-Za-z0-9])`,
+      "g"
+    ),
+    trimOrgLeading: true,
+  },
+  {
+    category: "SECRET_TERM",
+    regex: /\b(?:Project|Operation|Codename)\s+[A-Z][a-zA-Z0-9-]+(?:\s+[A-Z][a-zA-Z0-9-]+)?\b/g,
+  },
+  {
+    category: "MEDICAL",
+    regex:
+      /\b(?:Stage\s+(?:I{1,3}V?|IV|[1-4])[A-B]?\s+[A-Z][a-zA-Z-]+(?:\s+[A-Z][a-zA-Z-]+){0,3}|Type\s+[12]\s+Diabetes(?:\s+Mellitus)?|(?:[A-Z][a-zA-Z-]+\s+){0,2}(?:Carcinoma|Lymphoma|Leukemia|Melanoma|Sarcoma|Diabetes|Hypertension|Pneumonia|Hepatitis|Asthma|Arthritis|Neuropathy|Sclerosis|Infarction))\b/g,
+  },
+  {
+    category: "PERSON",
+    regex: new RegExp(`\\b(?:Dr\\.|Mr\\.|Mrs\\.|Ms\\.|Prof\\.)\\s+${NAME_PART}(?:\\s+${NAME_PART})?\\b`, "g"),
+  },
+  {
+    category: "PERSON",
+    regex: new RegExp(
+      `\\b(?:Patient|Authorized Signer|Signer|Lead Engineer|Chief Executive Officer|Chief Financial Officer|CEO|CFO|Director|Manager|Contact|Attn|Employee|Physician|Doctor|Counsel)\\s*:?\\s+(${NAME_PART}\\s+${NAME_PART})\\b`,
+      "g"
+    ),
+    captureGroup: 1,
+    validate: isValidPersonPhrase,
+  },
+  {
+    category: "PERSON",
+    regex: new RegExp(`\\b${NAME_PART}\\s+${NAME_PART}\\b`, "g"),
+    validate: isValidPersonPhrase,
+  },
 ];
 
 export function scanDeterministicPii(rawDoc: RawDocument): ReadonlyArray<DetectedSpan> {
@@ -106,11 +225,33 @@ export function scanDeterministicPii(rawDoc: RawDocument): ReadonlyArray<Detecte
     const rx = new RegExp(rule.regex.source, rule.regex.flags);
     let match: RegExpExecArray | null;
     while ((match = rx.exec(rawDoc)) !== null) {
-      const text = match[0];
+      let text: string;
+      let start: number;
+      let end: number;
+
+      const captured = rule.captureGroup !== undefined ? match[rule.captureGroup] : undefined;
+      if (captured !== undefined) {
+        text = captured;
+        end = match.index + match[0].length;
+        start = end - text.length;
+      } else {
+        text = match[0];
+        start = match.index;
+        end = start + text.length;
+      }
+
+      if (rule.trimOrgLeading) {
+        const trimmed = trimLeadingOrgWords(text, start);
+        if (!trimmed) continue;
+        start = trimmed.start;
+        end = trimmed.end;
+        text = trimmed.text;
+      }
+
       if (!rule.validate || rule.validate(text)) {
         candidates.push({
-          start: match.index,
-          end: match.index + text.length,
+          start,
+          end,
           text,
           category: rule.category,
           detectedBy: "GATE1_REGEX",

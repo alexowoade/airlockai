@@ -108,6 +108,64 @@ describe("AirlockAI 6-Vector Pre-Flight Firewall & Zero-Leak Proofs", () => {
     }
   });
 
+  it("redacts PERSON, ORG, SECRET_TERM, and MEDICAL deterministically when Nano is unavailable", async () => {
+    const cases = [
+      {
+        policy: "NDA_STRICT" as const,
+        doc: `MUTUAL NON-DISCLOSURE AGREEMENT (Effective 2026-11-15)
+Between Helios Robotics Corp ("Discloser", contact: elena.vance@helios-robotics.test, +1-415-890-4421) and Apex Foundry LLC ("Recipient").
+1. Confidential Project: All schematics, pricing ($1,450,000.00 licensing floor), and API credentials (sk-live-9f8a7b6c5d4e3f2a1b0c9d8e7f) relating to Project Obsidian.
+3. Non-Solicit & IP Assignment: Recipient personnel (Lead Engineer Marcus Sterling, SSN 912-45-6789).`,
+        mustRedact: [
+          "Helios Robotics Corp",
+          "Apex Foundry LLC",
+          "Project Obsidian",
+          "Marcus Sterling",
+          "elena.vance@helios-robotics.test",
+          "912-45-6789",
+        ],
+      },
+      {
+        policy: "INVOICE_FINANCE" as const,
+        doc: `Billed To: Meridian Logistics Group (ap@meridian-logistics.test)
+Amount Due: $84,750.00. IBAN DE89370400440532013000.
+Authorized Signer: David Okonkwo (+1-212-555-0194).`,
+        mustRedact: ["Meridian Logistics Group", "David Okonkwo", "DE89370400440532013000"],
+      },
+      {
+        policy: "MEDICAL_HIPAA" as const,
+        doc: `Patient: Clara Lindqvist | SSN: 901-33-4482 | Email: clara.lindqvist@mail.test
+Facility: Northstar Oncology & Imaging Center
+Primary Diagnosis: Stage II Thyroid Carcinoma follow-up panel.`,
+        mustRedact: [
+          "Clara Lindqvist",
+          "Northstar Oncology & Imaging Center",
+          "Stage II Thyroid Carcinoma",
+        ],
+      },
+    ];
+
+    for (const tc of cases) {
+      const raw = asRawDocument(tc.doc);
+      const vault = new AirlockVault();
+      const spans = scanDeterministicPii(raw);
+      const sanitized = vault.redactSpans(raw, spans);
+      const verified = await verifyAndMintPayload({
+        rawDoc: raw,
+        candidateSanitized: sanitized,
+        vault,
+        policyProfile: tc.policy,
+      });
+      expect(verified.ok).toBe(true);
+      if (verified.ok) {
+        for (const secret of tc.mustRedact) {
+          expect(verified.payload.sanitizedText).not.toContain(secret);
+        }
+        expect(vault.rehydrate(verified.payload.sanitizedText)).toBe(String(raw));
+      }
+    }
+  });
+
   it("encrypts and decrypts local PII vault cleanly via AES-256-GCM", async () => {
     const vault = new AirlockVault();
     vault.register("elena.vance@helios.test", "EMAIL", "GATE1_REGEX");

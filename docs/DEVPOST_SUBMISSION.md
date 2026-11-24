@@ -34,7 +34,7 @@ AirlockAI is architected as a multi-platform monorepo sharing one canonical prot
 - **Cross-Platform Cryptographic & Redaction Parity:** Ensuring identical span overlap resolution, Luhn validation, Shannon entropy thresholds, Unicode NFKC normalization, and SHA-256 receipt digests across TypeScript and Kotlin required unifying both implementations against a single shared test suite (`spec/vectors.json`).
 
 ## Accomplishments that we're proud of
-- **14/14 Automated Proofs Green:** `@airlock/core` passes all 10 shared golden parity vectors plus a **1,000-run `fast-check` property-based fuzzing proof** asserting zero leaks across randomized contracts containing Luhn-valid cards, SSNs, emails, phones, and currency values.
+- **16/16 Automated Proofs Green:** `@airlock/core` passes all 11 shared golden parity vectors (including offline non-Nano NER parity) plus a **1,000-run `fast-check` property-based fuzzing proof** asserting zero leaks across randomized contracts containing Luhn-valid cards, SSNs, emails, phones, and currency values.
 - **Defense-in-Depth Down to the Database Rules:** Deployed live `firestore.rules` with server-side `hasNoRawPii` regex assertions and `allow update, delete: if false`, making raw PII persistence structurally impossible even from a modified client.
 - **True 3-Surface Multi-Platform Architecture:** Shipped a live hosted Web PWA, an unpacked MV3 Chrome Side Panel Extension, and a Native Kotlin Android app verified by cross-platform CI.
 
