@@ -4,11 +4,14 @@ import { getAuth, signInAnonymously, type Auth } from "firebase/auth";
 import {
   addDoc,
   collection,
+  deleteDoc,
+  doc,
   getDocs,
   getFirestore,
   limit,
   orderBy,
   query,
+  updateDoc,
   type Firestore,
 } from "firebase/firestore";
 import { fetchAndActivate, getRemoteConfig, getValue, type RemoteConfig } from "firebase/remote-config";
@@ -53,6 +56,8 @@ const firebaseConfig = {
   messagingSenderId: import.meta.env.VITE_FIREBASE_MESSAGING_SENDER_ID as string | undefined,
   appId: import.meta.env.VITE_FIREBASE_APP_ID as string | undefined,
 };
+
+export const activeProjectId = firebaseConfig.projectId ?? "local-demo";
 
 export const isFirebaseConfigured = Boolean(
   firebaseConfig.apiKey && firebaseConfig.projectId && firebaseConfig.appId
@@ -245,6 +250,10 @@ export interface LedgerEntry extends AirlockReceipt {
   readonly sanitizedSummary: string;
 }
 
+export interface LedgerRecord extends LedgerEntry {
+  readonly docId: string;
+}
+
 export async function writeZeroPiiAuditLedger(entry: LedgerEntry): Promise<string | null> {
   const handles = getFirebaseHandles();
   if (!handles) return null;
@@ -258,7 +267,7 @@ export async function writeZeroPiiAuditLedger(entry: LedgerEntry): Promise<strin
   return ref.id;
 }
 
-export async function fetchZeroPiiAuditLedger(): Promise<ReadonlyArray<LedgerEntry>> {
+export async function fetchZeroPiiAuditLedger(): Promise<ReadonlyArray<LedgerRecord>> {
   const handles = getFirebaseHandles();
   if (!handles) return [];
   if (!handles.auth.currentUser) {
@@ -271,5 +280,105 @@ export async function fetchZeroPiiAuditLedger(): Promise<ReadonlyArray<LedgerEnt
     limit(15)
   );
   const snap = await getDocs(q);
-  return snap.docs.map((d) => d.data() as LedgerEntry);
+  return snap.docs.map((d) => ({
+    ...(d.data() as LedgerEntry),
+    docId: d.id,
+  }));
+}
+
+export type Layer4AttackMode = "RAW_PII_INJECTION" | "LEDGER_OVERWRITE" | "LEDGER_DELETE";
+
+export interface Layer4AttackResult {
+  readonly mode: Layer4AttackMode;
+  readonly blockedByRules: boolean;
+  readonly errorCode: string;
+  readonly ruleEnforced: string;
+  readonly detail: string;
+  readonly latencyMs: number;
+}
+
+/**
+ * Live Layer-4 Red-Team Proof:
+ * Intentionally bypasses all client-side Airlock gates and attacks Cloud Firestore directly
+ * to prove server-side firestore.rules (hasNoRawPii + append-only immutability) reject a
+ * compromised client with PERMISSION_DENIED.
+ */
+export async function runLayer4FirestoreAttack(
+  mode: Layer4AttackMode,
+  targetDocId?: string
+): Promise<Layer4AttackResult> {
+  const handles = getFirebaseHandles();
+  if (!handles) {
+    throw new Error("Firebase must be connected to test live Cloud Firestore Security Rules.");
+  }
+  if (!handles.auth.currentUser) {
+    await signInAnonymously(handles.auth);
+  }
+  const uid = handles.auth.currentUser!.uid;
+  const t0 = performance.now();
+
+  const ruleEnforced =
+    mode === "RAW_PII_INJECTION"
+      ? "firestore.rules :: hasNoRawPii(sanitizedSummary)"
+      : "firestore.rules :: allow update, delete: if false (append-only ledger)";
+
+  try {
+    if (mode === "RAW_PII_INJECTION") {
+      const dummyHash = "a".repeat(64);
+      await addDoc(collection(handles.db, "users", uid, "audit_ledger"), {
+        receiptVersion: "airlock.v1",
+        rawDocSha256: dummyHash,
+        sanitizedPayloadSha256: dummyHash,
+        prevReceiptSha256: null,
+        receiptSha256: dummyHash,
+        redactedCount: 0,
+        checksPassed: 6,
+        firewallPassed: true,
+        policyProfile: "NDA_STRICT",
+        timestampIso: new Date().toISOString(),
+        inferenceSource: "IN_CLOUD",
+        riskLevel: "CRITICAL",
+        sanitizedSummary:
+          "BYPASS ATTACK: Raw SSN 912-45-6789 and email elena.vance@helios-robotics.test",
+      });
+    } else if (mode === "LEDGER_OVERWRITE") {
+      const ref = doc(handles.db, "users", uid, "audit_ledger", targetDocId ?? "append-only-probe");
+      await updateDoc(ref, {
+        riskLevel: "LOW",
+        sanitizedSummary: "TAMPERED_BY_COMPROMISED_CLIENT",
+      });
+    } else {
+      const ref = doc(handles.db, "users", uid, "audit_ledger", targetDocId ?? "append-only-probe");
+      await deleteDoc(ref);
+    }
+
+    return {
+      mode,
+      blockedByRules: false,
+      errorCode: "UNEXPECTED_ALLOW",
+      ruleEnforced,
+      detail: "WARNING: Firestore accepted the attack payload. Verify firestore.rules deployment.",
+      latencyMs: Math.max(1, Math.round(performance.now() - t0)),
+    };
+  } catch (err) {
+    const code =
+      typeof err === "object" && err !== null && "code" in err
+        ? String((err as { code?: unknown }).code)
+        : "permission-denied";
+    const msg = err instanceof Error ? err.message : String(err);
+    const isPermissionDenied =
+      code.toLowerCase().includes("permission-denied") ||
+      msg.toLowerCase().includes("missing or insufficient permissions");
+
+    return {
+      mode,
+      blockedByRules: isPermissionDenied,
+      errorCode: code,
+      ruleEnforced,
+      detail: isPermissionDenied
+        ? `Cloud Firestore server rejected the bypassed request (${code}). Zero PII stored; ledger immutable.`
+        : `Firestore request failed with ${code}: ${msg}`,
+      latencyMs: Math.max(1, Math.round(performance.now() - t0)),
+    };
+  }
 }
