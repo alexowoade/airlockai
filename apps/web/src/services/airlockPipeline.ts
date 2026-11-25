@@ -20,14 +20,22 @@ import {
   type AirlockPolicyConfig,
 } from "./firebase.js";
 import { wireTap } from "./wireTap.js";
+import {
+  analyzeResidualRisks,
+  quasiHitsToSpans,
+  type ResidualRiskReport,
+} from "../utils/residualGuard.js";
 
 export interface LocalAirlockOutput {
   readonly rawDoc: RawDocument;
   readonly candidateSanitized: string;
   readonly vault: AirlockVault;
+  readonly mergedSpans: ReadonlyArray<DetectedSpan>;
   readonly gate1Count: number;
   readonly gate2Count: number;
+  readonly customCount: number;
   readonly gate2UsedNano: boolean;
+  readonly residualRisk: ResidualRiskReport;
   readonly firewallResult: FirewallResult;
 }
 
@@ -57,7 +65,8 @@ interface NanoExtractionJson {
 function findAllOccurrences(
   haystack: string,
   needle: string,
-  category: EntityCategory
+  category: EntityCategory,
+  detectedBy: "GATE1_REGEX" | "GATE2_NANO_ON_DEVICE" = "GATE2_NANO_ON_DEVICE"
 ): DetectedSpan[] {
   const spans: DetectedSpan[] = [];
   const trimmed = needle.trim();
@@ -74,7 +83,7 @@ function findAllOccurrences(
       end: idx + trimmed.length,
       text: haystack.slice(idx, idx + trimmed.length),
       category,
-      detectedBy: "GATE2_NANO_ON_DEVICE",
+      detectedBy,
     });
     offset = idx + trimmed.length;
   }
@@ -82,14 +91,17 @@ function findAllOccurrences(
 }
 
 /**
- * Runs Gate 1 (Deterministic PII + NER) -> Guarded Gate 2 (ONLY_ON_DEVICE Nano) -> Gate 3 (6-Vector Firewall).
- * Accepts raw text and/or an inline PNG/JPEG image (raw image NEVER leaves the device).
+ * Runs Gate 1 (Deterministic PII + NER + Optional Safe Harbor + Custom Secrets)
+ * -> Guarded Gate 2 (ONLY_ON_DEVICE Nano)
+ * -> Gate 3 (6-Vector Firewall) + Residual Risk Analysis.
  */
 export async function runLocalAirlock(params: {
   rawText: string;
   imageBase64?: { mimeType: "image/png" | "image/jpeg"; data: string };
   policy: AirlockPolicyConfig;
   prevReceiptSha256: string | null;
+  customSecrets?: ReadonlyArray<string>;
+  strictSafeHarbor?: boolean;
 }): Promise<LocalAirlockOutput> {
   const handles = getFirebaseHandles();
   const vault = new AirlockVault();
@@ -107,7 +119,8 @@ export async function runLocalAirlock(params: {
         `under policy ${params.policy.profile}. ` +
         (params.imageBase64
           ? "Also transcribe all visible text from the attached document image into extractedText."
-          : `Analyze this document:\n${workingText}`);
+          : `Analyze this document:
+${workingText}`);
 
       const parts: string | (string | Part)[] = params.imageBase64
         ? [
@@ -127,7 +140,7 @@ export async function runLocalAirlock(params: {
       }
       if (parsed.entities && workingText) {
         for (const ent of parsed.entities) {
-          gate2Spans.push(...findAllOccurrences(workingText, ent.text, ent.category));
+          gate2Spans.push(...findAllOccurrences(workingText, ent.text, ent.category, "GATE2_NANO_ON_DEVICE"));
         }
       }
       gate2UsedNano = true;
@@ -162,17 +175,27 @@ export async function runLocalAirlock(params: {
   const g1Start = performance.now();
   const rawDoc = asRawDocument(workingText);
   const gate1Spans = scanDeterministicPii(rawDoc);
-  const uniqueCategories = Array.from(new Set(gate1Spans.map((s) => s.category))).join(", ");
+
+  // Optional Strict HIPAA Safe Harbor quasi-identifier spans + user Custom Secrets
+  const safeHarborSpans = params.strictSafeHarbor ? quasiHitsToSpans(workingText) : [];
+  const customSpans: DetectedSpan[] = [];
+  for (const term of params.customSecrets ?? []) {
+    customSpans.push(...findAllOccurrences(workingText, term, "SECRET_TERM", "GATE1_REGEX"));
+  }
+
+  const allLocalSpans = [...gate1Spans, ...safeHarborSpans, ...customSpans];
+  const uniqueCategories = Array.from(new Set(allLocalSpans.map((s) => s.category))).join(", ");
   wireTap.record({
     stage: "GATE1_REGEX",
     inferenceSource: "DETERMINISTIC_LOCAL",
     latencyMs: Math.max(1, Math.round(performance.now() - g1Start)),
     bytesSent: 0,
-    payloadPreview: `Deterministic scanner matched ${gate1Spans.length} local spans (${uniqueCategories || "none"}).`,
+    payloadPreview: `Deterministic scanner matched ${gate1Spans.length} core + ${safeHarborSpans.length} Safe Harbor + ${customSpans.length} custom spans (${uniqueCategories || "none"}).`,
   });
 
-  const mergedSpans = resolveOverlappingSpans([...gate1Spans, ...gate2Spans]);
+  const mergedSpans = resolveOverlappingSpans([...allLocalSpans, ...gate2Spans]);
   const candidateSanitized = vault.redactSpans(rawDoc, mergedSpans);
+  const residualRisk = analyzeResidualRisks(candidateSanitized, gate2UsedNano);
 
   // Gate 3: Hard 6-Vector Pre-Flight Leak Firewall
   const firewallResult = await verifyAndMintPayload({
@@ -193,15 +216,26 @@ export async function runLocalAirlock(params: {
         .map((v) => `${v.vector} (${v.category})`)
         .join(", ")}`,
     });
+  } else {
+    wireTap.record({
+      stage: "GATE3_FIREWALL_PASS",
+      inferenceSource: "DETERMINISTIC_LOCAL",
+      latencyMs: 1,
+      bytesSent: 0,
+      payloadPreview: `6/6 firewall vectors passed — SHA-256 ${firewallResult.payload.receipt.receiptSha256.slice(0, 16)}… minted (${firewallResult.payload.receipt.redactedCount} entities redacted, 0B sent).`,
+    });
   }
 
   return {
     rawDoc,
     candidateSanitized,
     vault,
-    gate1Count: gate1Spans.length,
+    mergedSpans,
+    gate1Count: gate1Spans.length + safeHarborSpans.length,
     gate2Count: gate2Spans.length,
+    customCount: customSpans.length,
     gate2UsedNano,
+    residualRisk,
     firewallResult,
   };
 }
@@ -219,7 +253,9 @@ export async function runHybridTriage(
 
   const t0 = performance.now();
   const res = await handles.hybridTriageModel.generateContent(
-    `Classify and give a one-sentence risk summary of this sanitized document:\n\n${verified.sanitizedText}`
+    `Classify and give a one-sentence risk summary of this sanitized document:
+
+${verified.sanitizedText}`
   );
   const latencyMs = Math.round(performance.now() - t0);
   const rawSource = (res.response.inferenceSource ?? "IN_CLOUD").toUpperCase();
@@ -279,12 +315,18 @@ export async function runDeepCloudAudit(params: {
     sanitizedMarkdown = res.response.text();
     usedServerTemplate = true;
   } catch {
-    // Graceful fallback to ONLY_IN_CLOUD if server template hasn't been created in console yet
     const fallbackPrompt =
       `You are AirlockAI's compliance auditor (${params.policyProfile}). ` +
-      `Preserve all redacted tokens like [ORG_1] or [CURRENCY_1] verbatim so the client can re-hydrate locally.\n` +
-      `Provide:\n1. Overall Risk Level (LOW/MEDIUM/HIGH/CRITICAL)\n2. Top 3 Risk Clauses\n3. Redline Counter-Proposals\n\n` +
-      `Sanitized Document:\n${params.verified.sanitizedText}`;
+      `Preserve all redacted tokens like [ORG_1] or [CURRENCY_1] verbatim so the client can re-hydrate locally.
+` +
+      `Provide:
+1. Overall Risk Level (LOW/MEDIUM/HIGH/CRITICAL)
+2. Top 3 Risk Clauses
+3. Redline Counter-Proposals
+
+` +
+      `Sanitized Document:
+${params.verified.sanitizedText}`;
     const res = await handles.cloudAuditFallbackModel.generateContent(fallbackPrompt);
     sanitizedMarkdown = res.response.text();
   }
@@ -302,7 +344,6 @@ export async function runDeepCloudAudit(params: {
       : `ONLY_IN_CLOUD fallback audited sanitized skeleton (${params.verified.receipt.redactedCount} redacted tokens).`,
   });
 
-  // Extract a zero-PII 1-line summary for the Firestore Audit Ledger
   const riskMatch = sanitizedMarkdown.match(/\b(CRITICAL|HIGH|MEDIUM|LOW)\b/i);
   const riskLevel = riskMatch?.[1]?.toUpperCase() ?? "MEDIUM";
   const sanitizedSummary = `Policy ${params.policyProfile} audit: ${params.verified.receipt.redactedCount} entities redacted, 6/6 firewall vectors passed.`;

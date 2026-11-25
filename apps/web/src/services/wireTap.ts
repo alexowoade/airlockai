@@ -5,6 +5,7 @@ export interface WireEvent {
     | "GATE1_REGEX"
     | "GATE2_NANO_ON_DEVICE"
     | "GATE3_FIREWALL_BLOCK"
+  | "GATE3_FIREWALL_PASS"
     | "OFFLINE_TRIAGE"
     | "CLOUD_TEMPLATE_AUDIT"
     | "HTTP_WIRE_OUTBOUND";
