@@ -20,8 +20,8 @@ import com.airlockai.app.firebase.AndroidTriageOutput
 import kotlinx.coroutines.launch
 
 private const val SAMPLE_NDA =
-    "MUTUAL NDA (2026-11-15) between Helios Robotics (elena.vance@helios.test, +1-415-890-4421) and Apex Foundry. " +
-        "Pricing cap $1,450,000.00, credential sk-live-9f8a7b6c5d4e3f2a1b0c9d8e7f, Lead Engineer SSN 912-45-6789. " +
+    "MUTUAL NDA (2026-11-15) between Helios Robotics Corp (elena.vance@helios.test, +1-415-890-4421) and Apex Foundry LLC. " +
+        "Pricing cap $1,450,000.00, credential sk-live-9f8a7b6c5d4e3f2a1b0c9d8e7f, Lead Engineer SSN 912-45-6789, MRN-884210, ZIP 94107. " +
         "Recipient assumes unlimited liability with perpetual IP assignment."
 
 class MainActivity : ComponentActivity() {
@@ -44,17 +44,42 @@ private fun AirlockAndroidScreen(service: AndroidAirlockHybridService) {
     val scope = rememberCoroutineScope()
     var rawText by remember { mutableStateOf(SAMPLE_NDA) }
     var policy by remember { mutableStateOf(PolicyProfile.NDA_STRICT) }
+    var strictSafeHarbor by remember { mutableStateOf(false) }
+    var customSecrets by remember { mutableStateOf<List<String>>(emptyList()) }
+    var overrideFailClosed by remember { mutableStateOf(false) }
+
     var busy by remember { mutableStateOf(false) }
     var errorMsg by remember { mutableStateOf<String?>(null) }
 
     var localOut by remember { mutableStateOf<AndroidLocalAirlockOutput?>(null) }
     var redTeamAlert by remember { mutableStateOf<String?>(null) }
+    var injectionAlert by remember { mutableStateOf<String?>(null) }
     var triageOut by remember { mutableStateOf<AndroidTriageOutput?>(null) }
     var cloudOut by remember { mutableStateOf<AndroidCloudAuditOutput?>(null) }
     var showRehydrated by remember { mutableStateOf(true) }
     var ledgerItems by remember { mutableStateOf<List<String>>(emptyList()) }
+    var merkleRoot by remember { mutableStateOf<String?>(null) }
 
     val verifiedPayload = (localOut?.firewallResult as? FirewallResult.Passed)?.payload
+    val cloudLockedByFailClosed = (localOut?.residualRisk?.requiresReview == true) && !overrideFailClosed
+
+    fun triggerLocalAirlock(nextSafeHarbor: Boolean = strictSafeHarbor, nextSecrets: List<String> = customSecrets) {
+        scope.launch {
+            busy = true
+            errorMsg = null
+            redTeamAlert = null
+            triageOut = null
+            cloudOut = null
+            overrideFailClosed = false
+            localOut = service.runLocalAirlock(
+                rawText = rawText,
+                policy = policy,
+                strictSafeHarbor = nextSafeHarbor,
+                customSecrets = nextSecrets,
+            )
+            busy = false
+        }
+    }
 
     Column(
         modifier = Modifier
@@ -82,6 +107,17 @@ private fun AirlockAndroidScreen(service: AndroidAirlockHybridService) {
             }
         }
 
+        Row(horizontalArrangement = Arrangement.spacedBy(8.dp)) {
+            FilterChip(
+                selected = strictSafeHarbor,
+                onClick = {
+                    strictSafeHarbor = !strictSafeHarbor
+                    if (localOut != null) triggerLocalAirlock(nextSafeHarbor = strictSafeHarbor)
+                },
+                label = { Text("Strict Safe Harbor (URL/IP/ZIP/ID): ${if (strictSafeHarbor) "ON" else "OFF"}") },
+            )
+        }
+
         OutlinedTextField(
             value = rawText,
             onValueChange = { rawText = it },
@@ -90,28 +126,54 @@ private fun AirlockAndroidScreen(service: AndroidAirlockHybridService) {
         )
 
         Button(
-            onClick = {
-                scope.launch {
-                    busy = true
-                    errorMsg = null
-                    redTeamAlert = null
-                    triageOut = null
-                    cloudOut = null
-                    localOut = service.runLocalAirlock(rawText, policy)
-                    busy = false
-                }
-            },
+            onClick = { triggerLocalAirlock() },
             enabled = !busy && rawText.isNotBlank(),
             modifier = Modifier.fillMaxWidth(),
         ) {
             Text(if (busy) "Running 3-Gate Local Airlock..." else "1. Run 3-Gate Local Airlock (0B Sent)")
         }
 
+        localOut?.let { out ->
+            if (!out.injectionGuard.clean) {
+                Text(
+                    "PROMPT INJECTION NEUTRALIZED LOCALLY: ${out.injectionGuard.findings.size} clause(s) (${out.injectionGuard.findings.joinToString { it.rule }})",
+                    color = Color(0xFFF87171),
+                    style = MaterialTheme.typography.labelMedium,
+                )
+            }
+
+            if (out.residualRisk.requiresReview) {
+                Card(modifier = Modifier.fillMaxWidth()) {
+                    Column(Modifier.padding(12.dp), verticalArrangement = Arrangement.spacedBy(6.dp)) {
+                        Text(
+                            "FAIL-CLOSED GUARD ACTIVE (Risk: ${out.residualRisk.riskLevel}) — Cloud Locked",
+                            color = Color(0xFFFBBF24),
+                            style = MaterialTheme.typography.labelLarge,
+                        )
+                        Row(horizontalArrangement = Arrangement.spacedBy(6.dp)) {
+                            out.residualRisk.flaggedProperNouns.take(3).forEach { term ->
+                                OutlinedButton(
+                                    onClick = {
+                                        val updated = (customSecrets + term).distinct()
+                                        customSecrets = updated
+                                        triggerLocalAirlock(nextSecrets = updated)
+                                    }
+                                ) { Text("+ Redact \"$term\"") }
+                            }
+                            TextButton(onClick = { overrideFailClosed = !overrideFailClosed }) {
+                                Text(if (overrideFailClosed) "Re-Lock Cloud" else "Override")
+                            }
+                        }
+                    }
+                }
+            }
+        }
+
         verifiedPayload?.let { verified ->
             Card(modifier = Modifier.fillMaxWidth()) {
                 Column(Modifier.padding(12.dp), verticalArrangement = Arrangement.spacedBy(8.dp)) {
                     Text(
-                        "6/6 Firewall Passed · ${verified.receipt.redactedCount} redacted · SHA-256 ${verified.receipt.receiptSha256.take(14)}…",
+                        "6/6 Firewall Passed · ${verified.receipt.redactedCount} redacted · Risk: ${localOut?.residualRisk?.riskLevel ?: "LOW"} · SHA-256 ${verified.receipt.receiptSha256.take(14)}…",
                         color = Color(0xFF34D399),
                         style = MaterialTheme.typography.labelLarge,
                     )
@@ -133,7 +195,7 @@ private fun AirlockAndroidScreen(service: AndroidAirlockHybridService) {
                                     redTeamAlert = "BLOCKED BASE64 EXFIL — 0B sent (${blocked.blockedBytes}B aborted). Vector: ${blocked.violations.first().vector}"
                                 }
                             }
-                        ) { Text("Red-Team: Base64") }
+                        ) { Text("Base64") }
 
                         OutlinedButton(
                             onClick = {
@@ -150,14 +212,25 @@ private fun AirlockAndroidScreen(service: AndroidAirlockHybridService) {
                                     redTeamAlert = "BLOCKED CANARY INJECTION — 0B sent (${blocked.blockedBytes}B aborted). Vector: ${blocked.violations.first().vector}"
                                 }
                             }
-                        ) { Text("Red-Team: Canary") }
+                        ) { Text("Canary") }
+
+                        OutlinedButton(
+                            onClick = {
+                                val rep = AndroidSecurityGuards.neutralizePromptInjections(
+                                    "${verified.sanitizedText}\n\n${AndroidSecurityGuards.SAMPLE_INJECTION_PAYLOAD}"
+                                )
+                                injectionAlert =
+                                    "DISARMED ${rep.findings.size} INJECTION CLAUSE(S) (0B SENT): ${rep.findings.joinToString { it.rule }}"
+                            }
+                        ) { Text("Prompt Inj.") }
                     }
 
                     redTeamAlert?.let { Text(it, color = Color(0xFFF87171)) }
+                    injectionAlert?.let { Text(it, color = Color(0xFF34D399)) }
 
                     Row(horizontalArrangement = Arrangement.spacedBy(8.dp)) {
                         Button(
-                            enabled = !busy && service.isFirebaseReady,
+                            enabled = !busy && service.isFirebaseReady && !cloudLockedByFailClosed,
                             onClick = {
                                 scope.launch {
                                     busy = true
@@ -168,10 +241,10 @@ private fun AirlockAndroidScreen(service: AndroidAirlockHybridService) {
                                     busy = false
                                 }
                             }
-                        ) { Text("2. Triage (PREFER_ON_DEVICE)") }
+                        ) { Text("2. Triage") }
 
                         Button(
-                            enabled = !busy && service.isFirebaseReady,
+                            enabled = !busy && service.isFirebaseReady && !cloudLockedByFailClosed,
                             onClick = {
                                 scope.launch {
                                     busy = true
@@ -181,11 +254,13 @@ private fun AirlockAndroidScreen(service: AndroidAirlockHybridService) {
                                     }.onSuccess {
                                         cloudOut = it
                                         ledgerItems = service.fetchRecentLedgerSummaries()
+                                        val hashes = service.fetchRecentLedgerHashesChronological()
+                                        merkleRoot = AndroidMerkleTree.buildTree(hashes).root
                                     }.onFailure { errorMsg = it.message }
                                     busy = false
                                 }
                             }
-                        ) { Text("3. Cloud Template Audit") }
+                        ) { Text(if (cloudLockedByFailClosed) "Cloud Locked" else "3. Cloud Audit") }
                     }
                 }
             }
@@ -224,6 +299,9 @@ private fun AirlockAndroidScreen(service: AndroidAirlockHybridService) {
             Card(modifier = Modifier.fillMaxWidth()) {
                 Column(Modifier.padding(12.dp), verticalArrangement = Arrangement.spacedBy(4.dp)) {
                     Text("Cross-Device Firestore Zero-PII Ledger", style = MaterialTheme.typography.titleSmall)
+                    merkleRoot?.let {
+                        Text("SHA-256 Merkle Root: ${it.take(24)}…", color = Color(0xFF38BDF8), fontFamily = FontFamily.Monospace)
+                    }
                     ledgerItems.forEach { Text(it, fontFamily = FontFamily.Monospace) }
                 }
             }

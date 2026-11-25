@@ -29,7 +29,10 @@ data class AndroidLocalAirlockOutput(
     val vault: AirlockVault,
     val gate1Count: Int,
     val gate2Count: Int,
+    val customCount: Int = 0,
     val gate2UsedNano: Boolean,
+    val residualRisk: ResidualRiskReport,
+    val injectionGuard: PromptInjectionReport,
     val firewallResult: FirewallResult,
 )
 
@@ -76,6 +79,8 @@ class AndroidAirlockHybridService(context: Context) {
         policy: PolicyProfile,
         documentBitmap: Bitmap? = null,
         prevReceiptSha256: String? = null,
+        strictSafeHarbor: Boolean = false,
+        customSecrets: List<String> = emptyList(),
     ): AndroidLocalAirlockOutput {
         val vault = AirlockVault()
         var workingText = rawText.trim()
@@ -142,8 +147,14 @@ class AndroidAirlockHybridService(context: Context) {
 
         val rawDoc = RawDocument(workingText)
         val gate1Spans = Gate1Regex.scanDeterministicPii(rawDoc)
-        val merged = Gate1Regex.resolveOverlappingSpans(gate1Spans + gate2Spans)
-        val candidateSanitized = vault.redactSpans(rawDoc, merged)
+        val safeHarborSpans = if (strictSafeHarbor) AndroidSecurityGuards.scanSafeHarborSpans(workingText) else emptyList()
+        val customSpans = AndroidSecurityGuards.scanCustomSecretSpans(workingText, customSecrets)
+        val merged = Gate1Regex.resolveOverlappingSpans(gate1Spans + safeHarborSpans + customSpans + gate2Spans)
+        val rawCandidate = vault.redactSpans(rawDoc, merged)
+        val injectionGuard = AndroidSecurityGuards.neutralizePromptInjections(rawCandidate)
+        val candidateSanitized = injectionGuard.neutralizedText
+        val residualRisk = AndroidSecurityGuards.analyzeResidualRisks(candidateSanitized, gate2UsedNano)
+
         val firewallResult = Gate3Firewall.verifyAndMintPayload(
             rawDoc = rawDoc,
             candidateSanitized = candidateSanitized,
@@ -156,9 +167,12 @@ class AndroidAirlockHybridService(context: Context) {
             rawDoc = rawDoc,
             candidateSanitized = candidateSanitized,
             vault = vault,
-            gate1Count = gate1Spans.size,
+            gate1Count = gate1Spans.size + safeHarborSpans.size,
             gate2Count = gate2Spans.size,
+            customCount = customSpans.size,
             gate2UsedNano = gate2UsedNano,
+            residualRisk = residualRisk,
+            injectionGuard = injectionGuard,
             firewallResult = firewallResult,
         )
     }
@@ -278,6 +292,20 @@ class AndroidAirlockHybridService(context: Context) {
                 val summary = d.getString("sanitizedSummary") ?: ""
                 "[$hash…] $summary"
             }
+        }.getOrDefault(emptyList())
+    }
+
+    suspend fun fetchRecentLedgerHashesChronological(): List<String> {
+        if (!isFirebaseReady) return emptyList()
+        return runCatching {
+            val auth = Firebase.auth
+            val uid = auth.currentUser?.uid ?: auth.signInAnonymously().await().user!!.uid
+            val snap = Firebase.firestore.collection("users").document(uid)
+                .collection("audit_ledger")
+                .orderBy("timestampIso", Query.Direction.ASCENDING)
+                .limit(20)
+                .get().await()
+            snap.documents.mapNotNull { it.getString("receiptSha256") }
         }.getOrDefault(emptyList())
     }
 }
