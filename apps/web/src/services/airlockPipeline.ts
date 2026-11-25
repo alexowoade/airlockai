@@ -20,6 +20,7 @@ import {
   type AirlockPolicyConfig,
 } from "./firebase.js";
 import { wireTap } from "./wireTap.js";
+import { neutralizePromptInjections, type PromptInjectionReport } from "../utils/promptInjectionGuard.js";
 import {
   analyzeResidualRisks,
   quasiHitsToSpans,
@@ -36,6 +37,7 @@ export interface LocalAirlockOutput {
   readonly customCount: number;
   readonly gate2UsedNano: boolean;
   readonly residualRisk: ResidualRiskReport;
+  readonly injectionGuard: PromptInjectionReport;
   readonly firewallResult: FirewallResult;
 }
 
@@ -234,7 +236,18 @@ export async function runLocalAirlock(params: {
   });
 
   const mergedSpans = resolveOverlappingSpans([...allLocalSpans, ...gate2Spans]);
-  const candidateSanitized = vault.redactSpans(rawDoc, mergedSpans);
+  const rawCandidate = vault.redactSpans(rawDoc, mergedSpans);
+  const injectionGuard = neutralizePromptInjections(rawCandidate);
+  const candidateSanitized = injectionGuard.neutralizedText;
+  if (!injectionGuard.clean) {
+    wireTap.record({
+      stage: "PROMPT_INJECTION_GUARD",
+      inferenceSource: "BLOCKED",
+      latencyMs: 1,
+      bytesSent: 0,
+      payloadPreview: `NEUTRALIZED ${injectionGuard.findings.length} indirect prompt-injection clause(s) locally before cloud send (${injectionGuard.findings.map((f) => f.rule).join(", ")}).`,
+    });
+  }
   const residualRisk = analyzeResidualRisks(candidateSanitized, gate2UsedNano);
 
   // Gate 3: Hard 6-Vector Pre-Flight Leak Firewall
@@ -276,6 +289,7 @@ export async function runLocalAirlock(params: {
     customCount: customSpans.length,
     gate2UsedNano,
     residualRisk,
+    injectionGuard,
     firewallResult,
   };
 }
@@ -331,6 +345,7 @@ export async function runDeepCloudAudit(params: {
   policyProfile: PolicyProfile;
   templateIdOverride?: string;
   auditMode?: "SERVER_TEMPLATE" | "STRUCTURED_JSON";
+  onLedgerSynced?: (docId: string) => void;
 }): Promise<CloudAuditOutput> {
   const handles = getFirebaseHandles();
   if (!handles) {
@@ -413,17 +428,19 @@ export async function runDeepCloudAudit(params: {
     "MEDIUM";
   const sanitizedSummary = `Policy ${params.policyProfile} (${effectiveMode === "STRUCTURED_JSON" ? "JSON Schema" : "Template"}) audit: ${params.verified.receipt.redactedCount} entities redacted, 6/6 firewall vectors passed.`;
 
-  let ledgerDocId: string | null = null;
-  try {
-    ledgerDocId = await writeZeroPiiAuditLedger({
-      ...params.verified.receipt,
-      inferenceSource: "IN_CLOUD",
-      riskLevel,
-      sanitizedSummary,
+  const ledgerDocId: string | null = null;
+  void writeZeroPiiAuditLedger({
+    ...params.verified.receipt,
+    inferenceSource: "IN_CLOUD",
+    riskLevel,
+    sanitizedSummary,
+  })
+    .then((id) => {
+      if (id) params.onLedgerSynced?.(id);
+    })
+    .catch(() => {
+      // Offline or Firestore rules not yet deployed — audit result still succeeds locally
     });
-  } catch {
-    // Offline or Firestore rules not yet deployed — audit result still succeeds locally
-  }
 
   return {
     mode: effectiveMode,

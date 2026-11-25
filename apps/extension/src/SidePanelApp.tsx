@@ -272,6 +272,68 @@ export default function SidePanelApp() {
     }
   }
 
+  async function handleReplaceOnPage() {
+    if (!verified) return;
+    setErrorMsg(null);
+    try {
+      const [tab] = await chrome.tabs.query({ active: true, currentWindow: true });
+      if (!tab?.id) {
+        setErrorMsg("No active browser tab found.");
+        return;
+      }
+      const results = await chrome.scripting.executeScript({
+        target: { tabId: tab.id },
+        args: [verified.sanitizedText],
+        func: (safeText: string) => {
+          const el = document.activeElement as
+            | HTMLInputElement
+            | HTMLTextAreaElement
+            | HTMLElement
+            | null;
+          if (
+            el &&
+            (el.tagName === "TEXTAREA" ||
+              (el.tagName === "INPUT" &&
+                ["text", "search", "email", "url"].includes((el as HTMLInputElement).type)))
+          ) {
+            const field = el as HTMLInputElement | HTMLTextAreaElement;
+            const start = field.selectionStart ?? 0;
+            const end = field.selectionEnd ?? 0;
+            if (end > start) {
+              field.setRangeText(safeText, start, end, "end");
+            } else {
+              field.value = safeText;
+            }
+            field.dispatchEvent(new Event("input", { bubbles: true }));
+            return { replaced: true, target: field.tagName.toLowerCase() };
+          }
+
+          const sel = window.getSelection();
+          if (sel && sel.rangeCount > 0 && !sel.isCollapsed) {
+            const range = sel.getRangeAt(0);
+            range.deleteContents();
+            range.insertNode(document.createTextNode(safeText));
+            sel.collapseToEnd();
+            if (el && el.isContentEditable) {
+              el.dispatchEvent(new Event("input", { bubbles: true }));
+              return { replaced: true, target: "contentEditable" };
+            }
+            return { replaced: true, target: "page selection" };
+          }
+          return { replaced: false, target: "none" };
+        },
+      });
+      const outcome = results[0]?.result as { replaced: boolean; target: string } | undefined;
+      if (outcome?.replaced) {
+        setStatusMsg(`Scrubbed in-place on active page (${outcome.target}) — 0B raw PII leaked.`);
+      } else {
+        setErrorMsg("Focus a text box or highlight text on the page first, then click Replace on Page.");
+      }
+    } catch {
+      setErrorMsg("Cannot modify protected chrome:// tabs. Open any standard webpage or compose box.");
+    }
+  }
+
   async function copyText(label: string, text: string) {
     await navigator.clipboard.writeText(text);
     setStatusMsg(`Copied ${label} to clipboard.`);
@@ -433,6 +495,13 @@ export default function SidePanelApp() {
               onClick={() => verified && void copyText("sanitized skeleton", verified.sanitizedText)}
             >
               <Copy size={12} /> Copy Skeleton
+            </button>
+            <button
+              type="button"
+              disabled={!verified}
+              onClick={() => void handleReplaceOnPage()}
+            >
+              <MousePointerClick size={12} /> Replace on Page
             </button>
             <button
               type="button"

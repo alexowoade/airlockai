@@ -211,6 +211,7 @@ export function getFirebaseHandles(): FirebaseHandles | null {
       generationConfig: {
         responseMimeType: "application/json",
         responseSchema: structuredAuditSchema,
+        maxOutputTokens: 1400,
       },
     },
   });
