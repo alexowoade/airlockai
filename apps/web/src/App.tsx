@@ -96,6 +96,7 @@ import { exportExecutiveAuditBrief } from "./utils/auditBriefExport.js";
 import { neutralizePromptInjections, SAMPLE_INJECTION_PAYLOAD, type PromptInjectionReport } from "./utils/promptInjectionGuard.js";
 import { DEAL_ROOM_SCENARIOS } from "./data/dealRoomSamples.js";
 import { PolicyStudioPanel } from "./components/PolicyStudioPanel.js";
+import { MerkleSignerPanel } from "./components/MerkleSignerPanel.js";
 import type { CompliancePackId, CustomRegexRule } from "./utils/policyStudio.js";
 import type { StreamingAuditSnapshot } from "./utils/streamRehydrator.js";
 import { runDealRoomLocalAirlock, runDealRoomOracleAudit, type DealRoomAirlockOutput, type DealRoomOracleAuditOutput } from "./services/dealRoomPipeline.js";
@@ -2429,6 +2430,10 @@ export default function App() {
           {/* ================= TAB 3: LEDGER, ENCRYPTED VAULT & PROOF AUDITOR ================= */}
           {activeTab === "ledger" && (
             <>
+              <MerkleSignerPanel
+                recordsNewestFirst={combinedLedger}
+                projectId={activeProjectId}
+              />
               {/* FIRESTORE ZERO-PII HASH-CHAINED LEDGER + OFFLINE SYNC QUEUE */}
               <div className="row" style={{ justifyContent: "space-between", alignItems: "center" }}>
                 <h2 style={{ margin: 0 }}>Firestore Zero-PII Audit Ledger</h2>
@@ -2681,7 +2686,7 @@ export default function App() {
                 <div className="row" style={{ justifyContent: "space-between", alignItems: "center" }}>
                   <span className="muted" style={{ fontSize: "0.76rem" }}>
                     <FileCheck2 size={13} style={{ verticalAlign: "middle", marginRight: 5 }} />
-                    <strong>Zero-Trust External Proof Auditor</strong> (Offline — Verifies Ledger + Active Attestation)
+                    <strong>Zero-Trust External Proof Auditor</strong> (Offline — Verifies Ledger, Merkle Inclusion & ECDSA P-256)
                   </span>
                   <label
                     style={{

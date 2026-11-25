@@ -1,5 +1,15 @@
 import { sha256Hex, type AirlockReceipt, type VerifiedSanitizedPayload } from "@airlock/core";
 import type { LedgerRecord } from "../services/firebase.js";
+import {
+  buildMerkleTree,
+  verifyMerkleInclusionProof,
+  type MerkleInclusionProof,
+} from "./merkleTree.js";
+import {
+  signCanonicalPayload,
+  verifyCanonicalPayloadSignature,
+  type DeviceSignatureBlock,
+} from "./deviceSigner.js";
 
 export interface ChainVerificationReport {
   readonly ok: boolean;
@@ -21,6 +31,33 @@ export interface ExternalProofAuditReport {
   readonly piiFindings: ReadonlyArray<string>;
   readonly chainReport: ChainVerificationReport;
   readonly verdict: string;
+}
+
+export interface SignedMerkleSelectiveProof {
+  readonly certificateType: "AirlockAI.MerkleSelectiveDisclosureProof";
+  readonly protocolVersion: "airlock.v1";
+  readonly exportedAtIso: string;
+  readonly firebaseProjectId: string;
+  readonly containsRawPii: false;
+  readonly undisclosedSiblingsCount: number;
+  readonly disclosedReceipt: {
+    readonly docId: string;
+    readonly receiptVersion: string;
+    readonly policyProfile: string;
+    readonly riskLevel: string;
+    readonly inferenceSource: string;
+    readonly redactedCount: number;
+    readonly checksPassed: number;
+    readonly firewallPassed: boolean;
+    readonly timestampIso: string;
+    readonly receiptSha256: string;
+    readonly prevReceiptSha256: string | null;
+    readonly rawDocSha256: string;
+    readonly sanitizedPayloadSha256: string;
+    readonly sanitizedSummary: string;
+  };
+  readonly merkleProof: MerkleInclusionProof;
+  readonly deviceSignature: DeviceSignatureBlock;
 }
 
 /**
@@ -128,8 +165,70 @@ export function simulateOneByteTamper(
 }
 
 /**
- * Independent, 100% offline auditor for any exported AirlockAI.ZeroPiiComplianceProof JSON file.
- * Verifies schema, zero raw PII leakage, every SHA-256 receipt preimage, and prevReceiptSha256 linkage.
+ * Builds an ECDSA P-256 signed O(log N) Merkle Selective Disclosure Proof for ONE receipt,
+ * proving ledger inclusion without exposing any other ledger entries.
+ */
+export async function buildSignedMerkleSelectiveProof(params: {
+  projectId: string;
+  record: LedgerRecord;
+  merkleProof: MerkleInclusionProof;
+}): Promise<SignedMerkleSelectiveProof> {
+  const unsignedBody = {
+    certificateType: "AirlockAI.MerkleSelectiveDisclosureProof" as const,
+    protocolVersion: "airlock.v1" as const,
+    exportedAtIso: new Date().toISOString(),
+    firebaseProjectId: params.projectId,
+    containsRawPii: false as const,
+    undisclosedSiblingsCount: Math.max(0, params.merkleProof.totalLeaves - 1),
+    disclosedReceipt: {
+      docId: params.record.docId,
+      receiptVersion: params.record.receiptVersion,
+      policyProfile: params.record.policyProfile,
+      riskLevel: params.record.riskLevel,
+      inferenceSource: params.record.inferenceSource,
+      redactedCount: params.record.redactedCount,
+      checksPassed: params.record.checksPassed,
+      firewallPassed: params.record.firewallPassed,
+      timestampIso: params.record.timestampIso,
+      receiptSha256: params.record.receiptSha256,
+      prevReceiptSha256: params.record.prevReceiptSha256,
+      rawDocSha256: params.record.rawDocSha256,
+      sanitizedPayloadSha256: params.record.sanitizedPayloadSha256,
+      sanitizedSummary: params.record.sanitizedSummary,
+    },
+    merkleProof: params.merkleProof,
+  };
+
+  const deviceSignature = await signCanonicalPayload(
+    unsignedBody as unknown as Record<string, unknown>
+  );
+  return {
+    ...unsignedBody,
+    deviceSignature,
+  };
+}
+
+function scanCertificateForRawPii(rawJsonText: string): string[] {
+  const piiFindings: string[] = [];
+  if (/[A-Za-z0-9._%+-]+@[A-Za-z0-9.-]+\.[A-Za-z]{2,}/.test(rawJsonText)) {
+    piiFindings.push("Raw email pattern detected in certificate JSON.");
+  }
+  if (/\b\d{3}-\d{2}-\d{4}\b/.test(rawJsonText)) {
+    piiFindings.push("Raw SSN pattern detected in certificate JSON.");
+  }
+  if (/\b(?:\d{4}[- ]?){3}\d{4}\b/.test(rawJsonText)) {
+    piiFindings.push("Raw 16-digit card pattern detected in certificate JSON.");
+  }
+  if (/\b(?:sk-live-|AIza[0-9A-Za-z_-]{10,}|ghp_[0-9A-Za-z]{10,})/.test(rawJsonText)) {
+    piiFindings.push("Raw API secret prefix detected in certificate JSON.");
+  }
+  return piiFindings;
+}
+
+/**
+ * Independent, 100% offline auditor supporting BOTH:
+ * 1. AirlockAI.ZeroPiiComplianceProof (full ledger chain + active attestation + optional Merkle/ECDSA)
+ * 2. AirlockAI.MerkleSelectiveDisclosureProof (single receipt + O(log N) Merkle inclusion + ECDSA P-256)
  */
 export async function verifyExternalProofJson(
   fileName: string,
@@ -143,7 +242,7 @@ export async function verifyExternalProofJson(
     brokenLinkNumber: null,
     expectedHash: null,
     actualHash: null,
-    detail: "No valid ledgerHistory found in certificate.",
+    detail: "No valid ledger proof found in certificate.",
   };
 
   let parsed: Record<string, unknown>;
@@ -166,7 +265,83 @@ export async function verifyExternalProofJson(
   const proto = String(parsed.protocolVersion ?? "");
   const projectId = String(parsed.firebaseProjectId ?? "unknown");
   const exportedAtIso = String(parsed.exportedAtIso ?? "unknown");
+  const piiFindings = scanCertificateForRawPii(rawJsonText);
+  const zeroPiiClean = piiFindings.length === 0 && parsed.containsRawPii === false;
 
+  // Path A: Signed O(log N) Merkle Selective Disclosure Proof
+  if (certType === "AirlockAI.MerkleSelectiveDisclosureProof" && proto === "airlock.v1") {
+    const rec = parsed.disclosedReceipt as Partial<LedgerRecord> | undefined;
+    const merkleProof = parsed.merkleProof as MerkleInclusionProof | undefined;
+    const deviceSignature = parsed.deviceSignature as DeviceSignatureBlock | undefined;
+
+    if (!rec || !merkleProof || !deviceSignature) {
+      return {
+        ok: false,
+        fileName,
+        projectId,
+        exportedAtIso,
+        zeroPiiClean,
+        piiFindings,
+        chainReport: emptyChain,
+        verdict: "EXTERNAL PROOF REJECTED — Missing disclosedReceipt, merkleProof, or deviceSignature.",
+      };
+    }
+
+    const preimage = JSON.stringify({
+      receiptVersion: rec.receiptVersion,
+      rawDocSha256: rec.rawDocSha256,
+      sanitizedPayloadSha256: rec.sanitizedPayloadSha256,
+      prevReceiptSha256: rec.prevReceiptSha256 ?? null,
+      redactedCount: rec.redactedCount,
+      policyProfile: rec.policyProfile,
+      timestampIso: rec.timestampIso,
+    });
+    const recomputedReceipt = await sha256Hex(preimage);
+    const receiptIntact =
+      recomputedReceipt === rec.receiptSha256 &&
+      recomputedReceipt === merkleProof.leafReceiptSha256;
+
+    const merkleRes = await verifyMerkleInclusionProof(merkleProof);
+
+    const unsignedPayload: Record<string, unknown> = { ...parsed };
+    delete unsignedPayload.deviceSignature;
+    const sigRes = await verifyCanonicalPayloadSignature(unsignedPayload, deviceSignature);
+
+    const ok = zeroPiiClean && receiptIntact && merkleRes.ok && sigRes.ok;
+    const chainReport: ChainVerificationReport = {
+      ok: receiptIntact && merkleRes.ok && sigRes.ok,
+      totalLinks: merkleProof.totalLeaves,
+      verifiedHashes: receiptIntact ? 1 : 0,
+      verifiedLinks: merkleProof.proofPath.length,
+      brokenLinkNumber: ok ? null : merkleProof.leafIndex + 1,
+      expectedHash: ok ? null : merkleProof.merkleRoot,
+      actualHash: ok ? null : merkleRes.computedRoot,
+      detail: `${merkleRes.detail} ${sigRes.detail}`,
+    };
+
+    const verdict = ok
+      ? `SELECTIVE MERKLE + ECDSA PROOF VERIFIED OFFLINE — 1 disclosed receipt (${merkleProof.totalLeaves - 1} siblings kept private), O(log N) Merkle path (${merkleProof.proofPath.length} step(s)) -> Root ${merkleProof.merkleRoot.slice(0, 14)}… + ECDSA P-256 (${deviceSignature.kid}) valid · 0 Raw PII.`
+      : !zeroPiiClean
+        ? `EXTERNAL PROOF REJECTED — Raw PII violation (${piiFindings.join(" ")})`
+        : !receiptIntact
+          ? `EXTERNAL PROOF REJECTED — Disclosed receipt SHA-256 preimage tampered (${recomputedReceipt.slice(0, 14)}… != ${String(rec.receiptSha256 ?? "").slice(0, 14)}…).`
+          : !merkleRes.ok
+            ? `EXTERNAL PROOF REJECTED — ${merkleRes.detail}`
+            : `EXTERNAL PROOF REJECTED — ${sigRes.detail}`;
+
+    return {
+      ok,
+      fileName,
+      projectId,
+      exportedAtIso,
+      zeroPiiClean,
+      piiFindings,
+      chainReport,
+      verdict,
+    };
+  }
+
+  // Path B: Standard Full Ledger Compliance Certificate
   if (certType !== "AirlockAI.ZeroPiiComplianceProof" || proto !== "airlock.v1") {
     return {
       ok: false,
@@ -178,21 +353,6 @@ export async function verifyExternalProofJson(
       chainReport: emptyChain,
       verdict: "EXTERNAL PROOF REJECTED — Unrecognized certificate schema.",
     };
-  }
-
-  // Zero-PII scan over the entire exported JSON certificate
-  const piiFindings: string[] = [];
-  if (/[A-Za-z0-9._%+-]+@[A-Za-z0-9.-]+\.[A-Za-z]{2,}/.test(rawJsonText)) {
-    piiFindings.push("Raw email pattern detected in certificate JSON.");
-  }
-  if (/\b\d{3}-\d{2}-\d{4}\b/.test(rawJsonText)) {
-    piiFindings.push("Raw SSN pattern detected in certificate JSON.");
-  }
-  if (/\b(?:\d{4}[- ]?){3}\d{4}\b/.test(rawJsonText)) {
-    piiFindings.push("Raw 16-digit card pattern detected in certificate JSON.");
-  }
-  if (/\b(?:sk-live-|AIza[0-9A-Za-z_-]{10,}|ghp_[0-9A-Za-z]{10,})/.test(rawJsonText)) {
-    piiFindings.push("Raw API secret prefix detected in certificate JSON.");
   }
 
   let attestationChecked = false;
@@ -229,18 +389,53 @@ export async function verifyExternalProofJson(
 
   const rawHistory = Array.isArray(parsed.ledgerHistory) ? (parsed.ledgerHistory as LedgerRecord[]) : [];
   const chainReport = await verifyLedgerChain(rawHistory);
-  const zeroPiiClean = piiFindings.length === 0 && parsed.containsRawPii === false;
-  const ok = zeroPiiClean && attestationError === null && chainReport.ok && rawHistory.length > 0;
+
+  let merkleError: string | null = null;
+  if (typeof parsed.merkleRoot === "string" && rawHistory.length > 0) {
+    const chronoHashes = [...rawHistory].reverse().map((r) => r.receiptSha256);
+    const tree = await buildMerkleTree(chronoHashes);
+    if (tree.root !== parsed.merkleRoot) {
+      merkleError = `MERKLE ROOT MISMATCH: Recomputed root (${(tree.root ?? "null").slice(0, 14)}…) != certificate root (${parsed.merkleRoot.slice(0, 14)}…).`;
+    }
+  }
+
+  let sigError: string | null = null;
+  let sigChecked = false;
+  if (parsed.deviceSignature && typeof parsed.deviceSignature === "object") {
+    const unsignedPayload: Record<string, unknown> = { ...parsed };
+    delete unsignedPayload.deviceSignature;
+    const sigRes = await verifyCanonicalPayloadSignature(
+      unsignedPayload,
+      parsed.deviceSignature as DeviceSignatureBlock
+    );
+    if (!sigRes.ok) {
+      sigError = sigRes.detail;
+    } else {
+      sigChecked = true;
+    }
+  }
+
+  const ok =
+    zeroPiiClean &&
+    attestationError === null &&
+    merkleError === null &&
+    sigError === null &&
+    chainReport.ok &&
+    rawHistory.length > 0;
 
   const verdict = ok
-    ? `EXTERNAL PROOF VERIFIED OFFLINE — ${chainReport.verifiedHashes}/${chainReport.totalLinks} SHA-256 receipts & ${chainReport.verifiedLinks}/${Math.max(0, chainReport.totalLinks - 1)} chain links${attestationChecked ? " + active session attestation" : ""} intact · Zero raw PII detected.`
+    ? `EXTERNAL PROOF VERIFIED OFFLINE — ${chainReport.verifiedHashes}/${chainReport.totalLinks} SHA-256 receipts & ${chainReport.verifiedLinks}/${Math.max(0, chainReport.totalLinks - 1)} chain links${attestationChecked ? " + active session attestation" : ""}${sigChecked ? " + ECDSA P-256 signature" : ""} intact · Zero raw PII detected.`
     : !zeroPiiClean
       ? `EXTERNAL PROOF REJECTED — Raw PII violation (${piiFindings.join(" ")})`
       : attestationError !== null
         ? `EXTERNAL PROOF REJECTED — ${attestationError}`
-        : rawHistory.length === 0
-          ? "EXTERNAL PROOF INCOMPLETE — Certificate contains 0 ledger receipts."
-          : `EXTERNAL PROOF REJECTED — ${chainReport.detail}`;
+        : merkleError !== null
+          ? `EXTERNAL PROOF REJECTED — ${merkleError}`
+          : sigError !== null
+            ? `EXTERNAL PROOF REJECTED — ${sigError}`
+            : rawHistory.length === 0
+              ? "EXTERNAL PROOF INCOMPLETE — Certificate contains 0 ledger receipts."
+              : `EXTERNAL PROOF REJECTED — ${chainReport.detail}`;
 
   return {
     ok,
