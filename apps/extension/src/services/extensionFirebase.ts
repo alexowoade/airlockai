@@ -1,7 +1,7 @@
 import { initializeApp } from "firebase/app";
 import { CustomProvider, initializeAppCheck } from "firebase/app-check";
 import { getAuth, signInAnonymously } from "firebase/auth";
-import { addDoc, collection, getFirestore } from "firebase/firestore";
+import { addDoc, collection, getDocs, getFirestore, limit, orderBy, query } from "firebase/firestore";
 import {
   getAI,
   getGenerativeModel,
@@ -25,6 +25,11 @@ import {
   type RawDocument,
   type VerifiedSanitizedPayload,
 } from "@airlock/core";
+import {
+  analyzeExtensionResidualRisks,
+  scanSafeHarborSpans,
+  type ExtensionResidualReport,
+} from "../utils/extensionSecurity.js";
 
 export const POLICY_TEMPLATES: Record<PolicyProfile, string> = {
   NDA_STRICT: "airlock-nda-v1-0-0",
@@ -127,7 +132,12 @@ export async function checkLocalNanoStatus(): Promise<LocalNanoStatus> {
   }
 }
 
-function findOccurrences(haystack: string, needle: string, category: EntityCategory): DetectedSpan[] {
+function findOccurrences(
+  haystack: string,
+  needle: string,
+  category: EntityCategory,
+  detectedBy: "GATE1_REGEX" | "GATE2_NANO_ON_DEVICE" = "GATE2_NANO_ON_DEVICE"
+): DetectedSpan[] {
   const spans: DetectedSpan[] = [];
   const trimmed = needle.trim();
   if (trimmed.length < 3) return spans;
@@ -142,11 +152,32 @@ function findOccurrences(haystack: string, needle: string, category: EntityCateg
       end: idx + trimmed.length,
       text: haystack.slice(idx, idx + trimmed.length),
       category,
-      detectedBy: "GATE2_NANO_ON_DEVICE",
+      detectedBy,
     });
     offset = idx + trimmed.length;
   }
   return spans;
+}
+
+async function fetchLatestReceiptHash(): Promise<string | null> {
+  const h = getHandles();
+  if (!h) return null;
+  try {
+    if (!h.auth.currentUser) {
+      await signInAnonymously(h.auth);
+    }
+    const uid = h.auth.currentUser!.uid;
+    const q = query(
+      collection(h.db, "users", uid, "audit_ledger"),
+      orderBy("timestampIso", "desc"),
+      limit(1)
+    );
+    const snap = await getDocs(q);
+    const top = snap.docs[0]?.data() as { receiptSha256?: string } | undefined;
+    return typeof top?.receiptSha256 === "string" ? top.receiptSha256 : null;
+  } catch {
+    return null;
+  }
 }
 
 export interface SidePanelAirlockResult {
@@ -155,18 +186,27 @@ export interface SidePanelAirlockResult {
   readonly vault: AirlockVault;
   readonly gate1Count: number;
   readonly gate2Count: number;
+  readonly customCount: number;
   readonly usedNano: boolean;
+  readonly residualRisk: ExtensionResidualReport;
   readonly firewallResult: FirewallResult;
 }
 
-export async function runExtensionLocalAirlock(
-  rawText: string,
-  policy: PolicyProfile
-): Promise<SidePanelAirlockResult> {
+export async function runExtensionLocalAirlock(params: {
+  rawText: string;
+  policy: PolicyProfile;
+  strictSafeHarbor: boolean;
+  customSecrets: ReadonlyArray<string>;
+}): Promise<SidePanelAirlockResult> {
   const h = getHandles();
   const vault = new AirlockVault();
-  const rawDoc = asRawDocument(rawText.trim());
+  const rawDoc = asRawDocument(params.rawText.trim());
   const gate1Spans = scanDeterministicPii(rawDoc);
+  const safeHarborSpans = params.strictSafeHarbor ? scanSafeHarborSpans(rawDoc) : [];
+  const customSpans: DetectedSpan[] = [];
+  for (const term of params.customSecrets) {
+    customSpans.push(...findOccurrences(rawDoc, term, "SECRET_TERM", "GATE1_REGEX"));
+  }
   const gate2Spans: DetectedSpan[] = [];
   let usedNano = false;
 
@@ -175,13 +215,13 @@ export async function runExtensionLocalAirlock(
   if (h && nanoStatus === "available") {
     try {
       const res = await h.localPiiModel.generateContent(
-        `Extract contextual sensitive entities (PERSON, ORG, MEDICAL, SECRET_TERM) under policy ${policy}:\n${rawDoc}`
+        `Extract contextual sensitive entities (PERSON, ORG, MEDICAL, SECRET_TERM) under policy ${params.policy}:\n${rawDoc}`
       );
       const parsed = JSON.parse(res.response.text()) as {
         entities?: Array<{ text: string; category: "PERSON" | "ORG" | "MEDICAL" | "SECRET_TERM" }>;
       };
       for (const ent of parsed.entities ?? []) {
-        gate2Spans.push(...findOccurrences(rawDoc, ent.text, ent.category));
+        gate2Spans.push(...findOccurrences(rawDoc, ent.text, ent.category, "GATE2_NANO_ON_DEVICE"));
       }
       usedNano = true;
     } catch {
@@ -189,22 +229,33 @@ export async function runExtensionLocalAirlock(
     }
   }
 
-  const merged = resolveOverlappingSpans([...gate1Spans, ...gate2Spans]);
+  const merged = resolveOverlappingSpans([
+    ...gate1Spans,
+    ...safeHarborSpans,
+    ...customSpans,
+    ...gate2Spans,
+  ]);
   const candidateSanitized = vault.redactSpans(rawDoc, merged);
+  const residualRisk = analyzeExtensionResidualRisks(candidateSanitized, usedNano);
+  const prevReceiptSha256 = await fetchLatestReceiptHash();
+
   const firewallResult = await verifyAndMintPayload({
     rawDoc,
     candidateSanitized,
     vault,
-    policyProfile: policy,
+    policyProfile: params.policy,
+    prevReceiptSha256,
   });
 
   return {
     rawDoc,
     candidateSanitized,
     vault,
-    gate1Count: gate1Spans.length,
+    gate1Count: gate1Spans.length + safeHarborSpans.length,
     gate2Count: gate2Spans.length,
+    customCount: customSpans.length,
     usedNano,
+    residualRisk,
     firewallResult,
   };
 }
@@ -218,6 +269,7 @@ export async function runExtensionCloudAudit(params: {
   rehydratedMarkdown: string;
   usedTemplate: boolean;
   latencyMs: number;
+  syncedToLedger: boolean;
 }> {
   const h = getHandles();
   if (!h) {
@@ -250,7 +302,7 @@ export async function runExtensionCloudAudit(params: {
   const latencyMs = Math.round(performance.now() - t0);
   const rehydratedMarkdown = params.vault.rehydrate(sanitizedMarkdown);
 
-  // Sync zero-PII SHA-256 receipt to the same Firestore ledger used by Web PWA & Android
+  let syncedToLedger = false;
   try {
     if (!h.auth.currentUser) {
       await signInAnonymously(h.auth);
@@ -263,9 +315,10 @@ export async function runExtensionCloudAudit(params: {
       riskLevel: riskMatch?.[1]?.toUpperCase() ?? "MEDIUM",
       sanitizedSummary: `Chrome Side Panel (${params.policy}): ${params.verified.receipt.redactedCount} redacted, 6/6 firewall checks passed.`,
     });
+    syncedToLedger = true;
   } catch {
     // Non-blocking if offline or rules not deployed
   }
 
-  return { sanitizedMarkdown, rehydratedMarkdown, usedTemplate, latencyMs };
+  return { sanitizedMarkdown, rehydratedMarkdown, usedTemplate, latencyMs, syncedToLedger };
 }

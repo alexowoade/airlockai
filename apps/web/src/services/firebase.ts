@@ -97,6 +97,36 @@ const triageSchema = Schema.object({
   },
 });
 
+/**
+ * Structured JSON schema for interactive Deep Cloud Audit redline cards.
+ * Preserves redacted placeholders like [ORG_1] or [CURRENCY_1] verbatim for local re-hydration.
+ */
+const structuredAuditSchema = Schema.object({
+  properties: {
+    overallRiskLevel: Schema.enumString({ enum: ["LOW", "MEDIUM", "HIGH", "CRITICAL"] }),
+    executiveSummary: Schema.string({
+      description: "2-sentence executive compliance summary preserving placeholder tokens verbatim.",
+    }),
+    clauses: Schema.array({
+      items: Schema.object({
+        properties: {
+          clauseTitle: Schema.string({ description: "Short clause title (3-6 words)." }),
+          severity: Schema.enumString({ enum: ["LOW", "MEDIUM", "HIGH", "CRITICAL"] }),
+          issue: Schema.string({
+            description: "Concise legal/compliance risk explanation using placeholder tokens verbatim.",
+          }),
+          quotedExcerpt: Schema.string({
+            description: "Short sanitized excerpt from the document referencing the risky term.",
+          }),
+          redlineCounterProposal: Schema.string({
+            description: "Drop-in replacement clause wording preserving all placeholder tokens verbatim.",
+          }),
+        },
+      }),
+    }),
+  },
+});
+
 export interface FirebaseHandles {
   app: FirebaseApp;
   auth: Auth;
@@ -107,6 +137,7 @@ export interface FirebaseHandles {
   hybridTriageModel: GenerativeModel;
   templateAuditModel: TemplateGenerativeModel;
   cloudAuditFallbackModel: GenerativeModel;
+  structuredAuditModel: GenerativeModel;
 }
 
 let cachedHandles: FirebaseHandles | null = null;
@@ -172,6 +203,18 @@ export function getFirebaseHandles(): FirebaseHandles | null {
     },
   });
 
+  // 5. Structured JSON Clause Redline model (ONLY_IN_CLOUD with Firebase AI Logic Schema)
+  const structuredAuditModel = getGenerativeModel(ai, {
+    mode: InferenceMode.ONLY_IN_CLOUD,
+    inCloudParams: {
+      model: "gemini-3.5-flash-lite",
+      generationConfig: {
+        responseMimeType: "application/json",
+        responseSchema: structuredAuditSchema,
+      },
+    },
+  });
+
   cachedHandles = {
     app,
     auth,
@@ -182,6 +225,7 @@ export function getFirebaseHandles(): FirebaseHandles | null {
     hybridTriageModel,
     templateAuditModel,
     cloudAuditFallbackModel,
+    structuredAuditModel,
   };
   return cachedHandles;
 }

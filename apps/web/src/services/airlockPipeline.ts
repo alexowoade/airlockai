@@ -47,9 +47,25 @@ export interface OfflineTriageOutput {
   readonly latencyMs: number;
 }
 
+export interface StructuredRedlineClause {
+  readonly clauseTitle: string;
+  readonly severity: "LOW" | "MEDIUM" | "HIGH" | "CRITICAL";
+  readonly issue: string;
+  readonly quotedExcerpt: string;
+  readonly redlineCounterProposal: string;
+}
+
+export interface StructuredAuditPayload {
+  readonly overallRiskLevel: "LOW" | "MEDIUM" | "HIGH" | "CRITICAL";
+  readonly executiveSummary: string;
+  readonly clauses: ReadonlyArray<StructuredRedlineClause>;
+}
+
 export interface CloudAuditOutput {
+  readonly mode: "SERVER_TEMPLATE" | "STRUCTURED_JSON";
   readonly sanitizedMarkdown: string;
   readonly rehydratedMarkdown: string;
+  readonly structured: StructuredAuditPayload | null;
   readonly usedServerTemplate: boolean;
   readonly templateId: string;
   readonly inferenceSource: "IN_CLOUD";
@@ -90,6 +106,31 @@ function findAllOccurrences(
   return spans;
 }
 
+function normalizeRisk(value: unknown): "LOW" | "MEDIUM" | "HIGH" | "CRITICAL" {
+  const s = String(value ?? "MEDIUM").toUpperCase();
+  if (s.includes("CRITICAL")) return "CRITICAL";
+  if (s.includes("HIGH")) return "HIGH";
+  if (s.includes("LOW")) return "LOW";
+  return "MEDIUM";
+}
+
+function formatStructuredToMarkdown(structured: StructuredAuditPayload): string {
+  const lines: string[] = [
+    `Overall Risk Level: ${structured.overallRiskLevel}`,
+    "",
+    structured.executiveSummary,
+    "",
+    "Clause Redlines:",
+  ];
+  structured.clauses.forEach((c, idx) => {
+    lines.push(`${idx + 1}. [${c.severity}] ${c.clauseTitle}`);
+    lines.push(`   Issue: ${c.issue}`);
+    if (c.quotedExcerpt) lines.push(`   Excerpt: "${c.quotedExcerpt}"`);
+    lines.push(`   Redline: ${c.redlineCounterProposal}`);
+  });
+  return lines.join("\n");
+}
+
 /**
  * Runs Gate 1 (Deterministic PII + NER + Optional Safe Harbor + Custom Secrets)
  * -> Guarded Gate 2 (ONLY_ON_DEVICE Nano)
@@ -119,8 +160,7 @@ export async function runLocalAirlock(params: {
         `under policy ${params.policy.profile}. ` +
         (params.imageBase64
           ? "Also transcribe all visible text from the attached document image into extractedText."
-          : `Analyze this document:
-${workingText}`);
+          : `Analyze this document:\n${workingText}`);
 
       const parts: string | (string | Part)[] = params.imageBase64
         ? [
@@ -253,9 +293,7 @@ export async function runHybridTriage(
 
   const t0 = performance.now();
   const res = await handles.hybridTriageModel.generateContent(
-    `Classify and give a one-sentence risk summary of this sanitized document:
-
-${verified.sanitizedText}`
+    `Classify and give a one-sentence risk summary of this sanitized document:\n\n${verified.sanitizedText}`
   );
   const latencyMs = Math.round(performance.now() - t0);
   const rawSource = (res.response.inferenceSource ?? "IN_CLOUD").toUpperCase();
@@ -285,50 +323,72 @@ ${verified.sanitizedText}`
 
 /**
  * Deep Cloud Audit: Accepts ONLY compile-time VerifiedSanitizedPayload.
- * Calls Firebase Server Prompt Templates first, falling back cleanly to ONLY_IN_CLOUD if
- * the user hasn't provisioned the template in Firebase Console yet.
+ * Supports both Firebase Server Prompt Templates and Structured JSON Clause Redline Schema.
  */
 export async function runDeepCloudAudit(params: {
   verified: VerifiedSanitizedPayload;
   vault: AirlockVault;
   policyProfile: PolicyProfile;
   templateIdOverride?: string;
+  auditMode?: "SERVER_TEMPLATE" | "STRUCTURED_JSON";
 }): Promise<CloudAuditOutput> {
   const handles = getFirebaseHandles();
   if (!handles) {
     throw new Error("Configure Firebase keys in apps/web/.env.local to run Cloud Audit.");
   }
 
+  const requestedMode = params.auditMode ?? "SERVER_TEMPLATE";
   const templateId = params.templateIdOverride ?? POLICY_TEMPLATES[params.policyProfile];
   const t0 = performance.now();
   let sanitizedMarkdown = "";
+  let structured: StructuredAuditPayload | null = null;
   let usedServerTemplate = false;
+  let effectiveMode: "SERVER_TEMPLATE" | "STRUCTURED_JSON" = requestedMode;
 
-  try {
-    const res = await handles.templateAuditModel.generateContent({
-      templateId,
-      templateVariables: {
-        sanitizedText: params.verified.sanitizedText,
-        policyProfile: params.policyProfile,
-      },
-    });
-    sanitizedMarkdown = res.response.text();
-    usedServerTemplate = true;
-  } catch {
-    const fallbackPrompt =
+  if (requestedMode === "STRUCTURED_JSON") {
+    const schemaPrompt =
       `You are AirlockAI's compliance auditor (${params.policyProfile}). ` +
-      `Preserve all redacted tokens like [ORG_1] or [CURRENCY_1] verbatim so the client can re-hydrate locally.
-` +
-      `Provide:
-1. Overall Risk Level (LOW/MEDIUM/HIGH/CRITICAL)
-2. Top 3 Risk Clauses
-3. Redline Counter-Proposals
-
-` +
-      `Sanitized Document:
-${params.verified.sanitizedText}`;
-    const res = await handles.cloudAuditFallbackModel.generateContent(fallbackPrompt);
-    sanitizedMarkdown = res.response.text();
+      `Return structured JSON matching the schema with 3 high-impact clause redlines. ` +
+      `CRITICAL RULE: Preserve all redacted placeholder tokens like [ORG_1], [PERSON_1], [CURRENCY_1], [SECRET_TERM_1] verbatim so the client can re-hydrate locally.\n\n` +
+      `Sanitized Document:\n${params.verified.sanitizedText}`;
+    const res = await handles.structuredAuditModel.generateContent(schemaPrompt);
+    const rawJson = JSON.parse(res.response.text()) as Partial<StructuredAuditPayload>;
+    const normalizedClauses: StructuredRedlineClause[] = Array.isArray(rawJson.clauses)
+      ? rawJson.clauses.slice(0, 5).map((c) => ({
+          clauseTitle: String(c.clauseTitle ?? "Compliance Clause"),
+          severity: normalizeRisk(c.severity),
+          issue: String(c.issue ?? ""),
+          quotedExcerpt: String(c.quotedExcerpt ?? ""),
+          redlineCounterProposal: String(c.redlineCounterProposal ?? ""),
+        }))
+      : [];
+    structured = {
+      overallRiskLevel: normalizeRisk(rawJson.overallRiskLevel),
+      executiveSummary: String(rawJson.executiveSummary ?? ""),
+      clauses: normalizedClauses,
+    };
+    sanitizedMarkdown = formatStructuredToMarkdown(structured);
+    effectiveMode = "STRUCTURED_JSON";
+  } else {
+    try {
+      const res = await handles.templateAuditModel.generateContent({
+        templateId,
+        templateVariables: {
+          sanitizedText: params.verified.sanitizedText,
+          policyProfile: params.policyProfile,
+        },
+      });
+      sanitizedMarkdown = res.response.text();
+      usedServerTemplate = true;
+    } catch {
+      const fallbackPrompt =
+        `You are AirlockAI's compliance auditor (${params.policyProfile}). ` +
+        `Preserve all redacted tokens like [ORG_1] or [CURRENCY_1] verbatim so the client can re-hydrate locally.\n` +
+        `Provide:\n1. Overall Risk Level (LOW/MEDIUM/HIGH/CRITICAL)\n2. Top 3 Risk Clauses\n3. Redline Counter-Proposals\n\n` +
+        `Sanitized Document:\n${params.verified.sanitizedText}`;
+      const res = await handles.cloudAuditFallbackModel.generateContent(fallbackPrompt);
+      sanitizedMarkdown = res.response.text();
+    }
   }
 
   const latencyMs = Math.round(performance.now() - t0);
@@ -339,14 +399,19 @@ ${params.verified.sanitizedText}`;
     inferenceSource: "IN_CLOUD",
     latencyMs,
     bytesSent: new TextEncoder().encode(params.verified.sanitizedText).byteLength,
-    payloadPreview: usedServerTemplate
-      ? `Server Prompt Template (${templateId}) audited sanitized skeleton (${params.verified.receipt.redactedCount} redacted tokens).`
-      : `ONLY_IN_CLOUD fallback audited sanitized skeleton (${params.verified.receipt.redactedCount} redacted tokens).`,
+    payloadPreview:
+      effectiveMode === "STRUCTURED_JSON"
+        ? `Structured JSON Schema audited sanitized skeleton (${structured?.clauses.length ?? 0} redline cards, ${params.verified.receipt.redactedCount} redacted tokens).`
+        : usedServerTemplate
+          ? `Server Prompt Template (${templateId}) audited sanitized skeleton (${params.verified.receipt.redactedCount} redacted tokens).`
+          : `ONLY_IN_CLOUD fallback audited sanitized skeleton (${params.verified.receipt.redactedCount} redacted tokens).`,
   });
 
-  const riskMatch = sanitizedMarkdown.match(/\b(CRITICAL|HIGH|MEDIUM|LOW)\b/i);
-  const riskLevel = riskMatch?.[1]?.toUpperCase() ?? "MEDIUM";
-  const sanitizedSummary = `Policy ${params.policyProfile} audit: ${params.verified.receipt.redactedCount} entities redacted, 6/6 firewall vectors passed.`;
+  const riskLevel =
+    structured?.overallRiskLevel ??
+    sanitizedMarkdown.match(/\b(CRITICAL|HIGH|MEDIUM|LOW)\b/i)?.[1]?.toUpperCase() ??
+    "MEDIUM";
+  const sanitizedSummary = `Policy ${params.policyProfile} (${effectiveMode === "STRUCTURED_JSON" ? "JSON Schema" : "Template"}) audit: ${params.verified.receipt.redactedCount} entities redacted, 6/6 firewall vectors passed.`;
 
   let ledgerDocId: string | null = null;
   try {
@@ -361,8 +426,10 @@ ${params.verified.sanitizedText}`;
   }
 
   return {
+    mode: effectiveMode,
     sanitizedMarkdown,
     rehydratedMarkdown,
+    structured,
     usedServerTemplate,
     templateId,
     inferenceSource: "IN_CLOUD",

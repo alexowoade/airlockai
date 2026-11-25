@@ -1,20 +1,23 @@
 import { useEffect, useState, type ChangeEvent, type DragEvent } from "react";
 import {
   Activity,
+  Check,
   Cloud,
+  Copy,
   Cpu,
   Download,
-  Eye,
-  EyeOff,
   FileCheck2,
   FileImage,
+  FileJson,
   FileText,
   KeyRound,
+  Layers,
   Lock,
   Plus,
   RefreshCw,
   ShieldAlert,
   ShieldCheck,
+  Sparkles,
   Upload,
   WifiOff,
   Zap,
@@ -84,11 +87,20 @@ import {
   rehydrateWithEntries,
   type DecryptedVaultBundle,
 } from "./utils/encryptedVaultFile.js";
+import {
+  ZeroKnowledgeText,
+  type ZeroKnowledgeViewMode,
+} from "./components/ZeroKnowledgeText.js";
+import "./sprintC.css";
+
+type WorkspaceTab = "audit" | "redteam" | "ledger";
 
 const MAX_LOCAL_FILE_BYTES = 5_242_880; // 5 MB local browser cap for PDFs/images/text
 const TEXT_EXTENSIONS = [".txt", ".md", ".csv", ".json"];
 
 export default function App() {
+  const [activeTab, setActiveTab] = useState<WorkspaceTab>("audit");
+
   const [rawText, setRawText] = useState(SAMPLE_DOCS[0]!.text);
   const [uploadedFileName, setUploadedFileName] = useState<string | null>(null);
   const [isDraggingFile, setIsDraggingFile] = useState(false);
@@ -126,7 +138,8 @@ export default function App() {
 
   const [triageOut, setTriageOut] = useState<OfflineTriageOutput | null>(null);
   const [cloudOut, setCloudOut] = useState<CloudAuditOutput | null>(null);
-  const [showRehydrated, setShowRehydrated] = useState(true);
+  const [zkViewMode, setZkViewMode] = useState<ZeroKnowledgeViewMode>("diff");
+  const [copiedClauseIdx, setCopiedClauseIdx] = useState<number | null>(null);
 
   const [wireEvents, setWireEvents] = useState<ReadonlyArray<WireEvent>>([]);
   const [ledger, setLedger] = useState<ReadonlyArray<LedgerRecord>>([]);
@@ -143,10 +156,13 @@ export default function App() {
   const [vaultPassphrase, setVaultPassphrase] = useState("");
   const [vaultStatus, setVaultStatus] = useState<{ ok: boolean; message: string } | null>(null);
   const [restoredVault, setRestoredVault] = useState<DecryptedVaultBundle | null>(null);
-  const [showRestoredRehydrated, setShowRestoredRehydrated] = useState(true);
+  const [restoredViewMode, setRestoredViewMode] = useState<ZeroKnowledgeViewMode>("diff");
   const [externalProofReport, setExternalProofReport] = useState<ExternalProofAuditReport | null>(
     null
   );
+
+  // Sprint C1: Enterprise Hybrid Routing & ROI Volume Slider
+  const [monthlyDocsVolume, setMonthlyDocsVolume] = useState<number>(1000);
 
   // Combined ledger view (newest pending receipts chained above synced Firestore receipts)
   const combinedLedger: ReadonlyArray<LedgerRecord & { readonly syncStatus?: "PENDING_SYNC" }> = [
@@ -365,6 +381,7 @@ export default function App() {
         strictSafeHarbor: activeSafeHarbor,
       });
       setAirlockOut(result);
+      setActiveTab("audit");
 
       if (imageInput) {
         const redactedDataUrl = await renderRedactedImageOverlay(imageInput.dataUrl);
@@ -450,7 +467,7 @@ export default function App() {
       const text = await file.text();
       const bundle = await decryptVaultFromFileJson(text, vaultPassphrase);
       setRestoredVault(bundle);
-      setShowRestoredRehydrated(true);
+      setRestoredViewMode("diff");
       const latencyMs = Math.max(1, Math.round(performance.now() - t0));
       const msg = `VAULT RESTORED LOCALLY — ${bundle.entries.length} tokens unlocked from ${file.name} (${latencyMs} ms · 0B sent).`;
       setVaultStatus({ ok: true, message: msg });
@@ -631,9 +648,9 @@ export default function App() {
     }
   }
 
-  async function handleCloudAudit() {
+  async function handleCloudAudit(auditMode: "SERVER_TEMPLATE" | "STRUCTURED_JSON") {
     if (!airlockOut || !airlockOut.firewallResult.ok) return;
-    setBusy("cloud");
+    setBusy(auditMode === "STRUCTURED_JSON" ? "cloud-json" : "cloud");
     setErrorMsg(null);
     try {
       const res = await runDeepCloudAudit({
@@ -641,8 +658,10 @@ export default function App() {
         vault: airlockOut.vault,
         policyProfile: policy.profile,
         templateIdOverride: policy.templateId,
+        auditMode,
       });
       setCloudOut(res);
+      setZkViewMode("diff");
       const updated = await fetchZeroPiiAuditLedger().catch(() => []);
       if (updated.length > 0) {
         setLedger(updated);
@@ -656,6 +675,17 @@ export default function App() {
     }
   }
 
+  function handleCopyRedline(idx: number, sanitizedProposal: string) {
+    if (!airlockOut) return;
+    const textToCopy =
+      zkViewMode === "cloud"
+        ? sanitizedProposal
+        : airlockOut.vault.rehydrate(sanitizedProposal);
+    navigator.clipboard?.writeText(textToCopy).catch(() => {});
+    setCopiedClauseIdx(idx);
+    setTimeout(() => setCopiedClauseIdx((prev) => (prev === idx ? null : prev)), 1800);
+  }
+
   const verifiedPayload = airlockOut?.firewallResult.ok ? airlockOut.firewallResult.payload : null;
   const gate3BlockedViolations =
     airlockOut && !airlockOut.firewallResult.ok ? airlockOut.firewallResult.violations : null;
@@ -663,6 +693,7 @@ export default function App() {
     airlockOut?.residualRisk.failClosedRecommended && !residualOverrideAccepted
   );
   const currentPdfPage = pdfDoc?.pages[pdfPageIdx] ?? null;
+  const vaultEntries = airlockOut ? airlockOut.vault.getEntries(false) : [];
 
   // Live Hybrid Telemetry metrics
   const rawDocBytes = new TextEncoder().encode(rawText).byteLength;
@@ -675,6 +706,14 @@ export default function App() {
   const lastLocalMs = wireEvents.find((ev) => ev.stage === "GATE1_REGEX")?.latencyMs ?? null;
   const lastCloudMs =
     wireEvents.find((ev) => ev.stage === "CLOUD_TEMPLATE_AUDIT")?.latencyMs ?? null;
+
+  // Deterministic Hybrid Offload ROI Model (grounded in actual document entity count)
+  const entitiesPerDoc = verifiedPayload?.receipt.redactedCount ?? 10;
+  const rawPiiShieldedPerMonth = monthlyDocsVolume * entitiesPerDoc;
+  // Local Gate 1 + Gate 2 + Triage avoids 2 cloud passes (~1,150 tokens/doc) vs cloud-only DLP + triage
+  const cloudTokensOffloadedPerMonth = monthlyDocsVolume * 1150;
+  // Standard cloud enterprise DLP + LLM triage benchmark ~$0.018/doc saved locally
+  const monthlySpendAvoidedUsd = Math.round(monthlyDocsVolume * 0.018);
 
   const restoredSourceText =
     restoredVault?.sanitizedAuditMarkdown ?? restoredVault?.sanitizedText ?? "";
@@ -742,8 +781,8 @@ export default function App() {
 
       {errorMsg && <div className="alert-red" style={{ marginBottom: 14 }}>{errorMsg}</div>}
 
-      <div className="grid">
-        {/* LEFT COLUMN: RAW LOCAL INPUT STAGE */}
+      <div className="exec-grid">
+        {/* LEFT PANE: RAW LOCAL DOCUMENT STAGE (ALWAYS VISIBLE) */}
         <section className="card">
           <h2>
             <span>1. Local Document Stage (Never Leaves Device)</span>
@@ -928,337 +967,638 @@ export default function App() {
               ? "Running 3-Gate Local Airlock..."
               : "Run Local Airlock (Gate 1 + Nano Gate 2 + Gate 3)"}
           </button>
-
-          {/* PASSPHRASE-LOCKED .AIRLOCK.ENC VAULT EXPORT & RESTORE */}
-          <div style={{ borderTop: "1px solid var(--border)", paddingTop: 10 }}>
-            <div className="muted" style={{ marginBottom: 6 }}>
-              <KeyRound size={13} style={{ verticalAlign: "middle", marginRight: 5 }} />
-              <strong>Encrypted Local Vault (.airlock.enc)</strong> — PBKDF2 (100k) + AES-256-GCM
-            </div>
-            <div className="row" style={{ gap: 6 }}>
-              <input
-                type="password"
-                value={vaultPassphrase}
-                onChange={(e) => setVaultPassphrase(e.target.value)}
-                placeholder="Vault passphrase (min 6 chars)..."
-                style={{
-                  flex: 1,
-                  minWidth: 160,
-                  background: "#0b1220",
-                  color: "var(--text)",
-                  border: "1px solid var(--border)",
-                  borderRadius: 6,
-                  padding: "5px 8px",
-                  fontSize: "0.75rem",
-                }}
-              />
-              <button
-                type="button"
-                onClick={() => void handleExportEncryptedVault()}
-                disabled={!verifiedPayload || vaultPassphrase.trim().length < 6}
-                style={{ padding: "5px 9px", fontSize: "0.72rem" }}
-              >
-                <Download size={12} /> Export .airlock.enc
-              </button>
-              <label
-                style={{
-                  cursor: "pointer",
-                  fontSize: "0.72rem",
-                  padding: "5px 9px",
-                  borderRadius: 8,
-                  border: "1px solid var(--border)",
-                  background: "var(--panel-alt)",
-                  fontWeight: 600,
-                }}
-              >
-                Restore .airlock.enc
-                <input
-                  type="file"
-                  accept=".enc,.json"
-                  onChange={(e) => void handleRestoreEncryptedVault(e)}
-                  style={{ display: "none" }}
-                />
-              </label>
-            </div>
-
-            {vaultStatus && (
-              <div
-                className={vaultStatus.ok ? "alert-green" : "alert-red"}
-                style={{ marginTop: 8, fontSize: "0.75rem" }}
-              >
-                {vaultStatus.message}
-              </div>
-            )}
-
-            {restoredVault && (
-              <div className="wire-item" style={{ marginTop: 8, gap: 6 }}>
-                <div className="row" style={{ justifyContent: "space-between" }}>
-                  <span style={{ fontWeight: 700, fontSize: "0.74rem" }}>
-                    Restored Vault ({restoredVault.entries.length} tokens · Receipt{" "}
-                    <span className="mono">{restoredVault.receiptSha256.slice(0, 12)}…</span>)
-                  </span>
-                  <button
-                    type="button"
-                    onClick={() => setShowRestoredRehydrated((v) => !v)}
-                    style={{ padding: "3px 8px", fontSize: "0.7rem" }}
-                  >
-                    {showRestoredRehydrated ? <Eye size={12} /> : <EyeOff size={12} />}
-                    {showRestoredRehydrated ? "Restored Re-Hydrated" : "Sanitized Skeleton"}
-                  </button>
-                </div>
-                <div className="codebox" style={{ maxHeight: 140 }}>
-                  {showRestoredRehydrated
-                    ? rehydrateWithEntries(restoredSourceText, restoredVault.entries)
-                    : restoredSourceText}
-                </div>
-              </div>
-            )}
-          </div>
         </section>
 
-        {/* CENTER COLUMN: SANITIZED AIRLOCK, RESIDUAL GUARD, RED-TEAM LAB & RE-HYDRATED AUDIT */}
+        {/* RIGHT PANE: EXECUTIVE 3-TAB SECURITY & AUDIT WORKSPACE */}
         <section className="card">
-          <h2>
-            <span>2. Verified Airlock & Hybrid Inference</span>
-            {verifiedPayload && (
-              <span className="badge green">6/6 Firewall Checks Passed</span>
-            )}
-            {!verifiedPayload && airlockOut && (
-              <span className="badge red">Gate 3 Firewall Blocked</span>
-            )}
-          </h2>
+          <div className="tab-bar" role="tablist" aria-label="AirlockAI Workspace">
+            <button
+              type="button"
+              role="tab"
+              aria-selected={activeTab === "audit"}
+              className={`tab-btn ${activeTab === "audit" ? "active" : ""}`}
+              onClick={() => setActiveTab("audit")}
+            >
+              <Sparkles size={14} />
+              Audit Studio & Redlines
+              {verifiedPayload && <span className="tab-pill green">6/6</span>}
+            </button>
 
-          {airlockOut ? (
-            <>
-              {verifiedPayload ? (
-                <div className="alert-green">
-                  <strong>SHA-256 Attestation Minted:</strong>{" "}
-                  <span className="mono">{verifiedPayload.receipt.receiptSha256.slice(0, 24)}…</span>{" "}
-                  | Redacted: <strong>{verifiedPayload.receipt.redactedCount}</strong> entities (Gate 1:{" "}
-                  {airlockOut.gate1Count}, Nano Gate 2: {airlockOut.gate2Count}
-                  {airlockOut.customCount > 0 ? `, Custom: ${airlockOut.customCount}` : ""})
-                </div>
+            <button
+              type="button"
+              role="tab"
+              aria-selected={activeTab === "redteam"}
+              className={`tab-btn ${activeTab === "redteam" ? "active" : ""}`}
+              onClick={() => setActiveTab("redteam")}
+            >
+              <ShieldAlert size={14} />
+              Red-Team, Wire Tap & Routing
+              <span className="tab-pill">{wireEvents.length}</span>
+            </button>
+
+            <button
+              type="button"
+              role="tab"
+              aria-selected={activeTab === "ledger"}
+              className={`tab-btn ${activeTab === "ledger" ? "active" : ""}`}
+              onClick={() => setActiveTab("ledger")}
+            >
+              <Layers size={14} />
+              Ledger, Vault & Proof Auditor
+              {pendingQueue.length > 0 ? (
+                <span className="tab-pill amber">{pendingQueue.length} PENDING</span>
               ) : (
-                <div className="alert-red">
-                  <strong>GATE 3 PRE-FLIGHT FIREWALL BLOCKED — 0 BYTES TRANSMITTED</strong>
-                  <div style={{ marginTop: 4, fontSize: "0.78rem" }}>
-                    {gate3BlockedViolations?.map((v, idx) => (
-                      <div key={idx} className="mono">
-                        • {v.vector} ({v.category}): {v.detail}
-                      </div>
-                    ))}
-                  </div>
-                  <div className="muted" style={{ marginTop: 6, fontSize: "0.75rem", color: "#fecaca" }}>
-                    Tip: Enable <strong>Strict Safe Harbor</strong> (to scrub URLs/IPs/ZIPs/IDs) or add the leaking phrase to your <strong>Custom Secret Vault</strong> below to re-verify.
-                  </div>
-                </div>
+                <span className="tab-pill green">{combinedLedger.length} SYNCED</span>
               )}
+            </button>
+          </div>
 
-              {/* HIPAA SAFE HARBOR RISK METER + FAIL-CLOSED RESIDUAL PROPER-NOUN GUARD + CUSTOM VAULT */}
-              <div className="wire-item" style={{ gap: 6 }}>
-                <div className="row" style={{ justifyContent: "space-between" }}>
-                  <span style={{ fontWeight: 700, fontSize: "0.78rem" }}>
-                    Re-Identification & Safe Harbor Risk:{" "}
-                    <span
-                      className={`badge ${
-                        airlockOut.residualRisk.riskLevel === "LOW"
-                          ? "green"
-                          : airlockOut.residualRisk.riskLevel === "MODERATE"
-                            ? "amber"
-                            : "red"
-                      }`}
-                      style={{ marginLeft: 4 }}
-                    >
-                      {airlockOut.residualRisk.riskLevel}
-                    </span>
-                  </span>
-                  <button
-                    type="button"
-                    onClick={() => void handleToggleSafeHarbor()}
-                    style={{
-                      padding: "3px 8px",
-                      fontSize: "0.72rem",
-                      borderColor: strictSafeHarbor ? "#10b981" : undefined,
-                      color: strictSafeHarbor ? "#34d399" : undefined,
-                    }}
-                  >
-                    Strict Safe Harbor: {strictSafeHarbor ? "ON (URL/IP/ZIP/ID)" : "OFF"}
-                  </button>
-                </div>
-
-                <div className="muted" style={{ fontSize: "0.74rem" }}>
-                  {airlockOut.residualRisk.summary}
-                </div>
-
-                {airlockOut.residualRisk.residualProperNouns.length > 0 && (
-                  <div
-                    className={isCloudGatedByResidual ? "alert-red" : "wire-item"}
-                    style={{ padding: "8px 10px" }}
-                  >
-                    <div style={{ fontSize: "0.76rem", marginBottom: 6 }}>
-                      <strong>
-                        {isCloudGatedByResidual
-                          ? "FAIL-CLOSED GUARD ACTIVE (Non-Nano Mode):"
-                          : "Residual Proper Nouns Cleared:"}
-                      </strong>{" "}
-                      Click any flagged term to redact into local vault, or explicitly allow cloud send.
-                    </div>
-                    <div className="row" style={{ gap: 6 }}>
-                      {airlockOut.residualRisk.residualProperNouns.map((word) => (
-                        <button
-                          type="button"
-                          key={word}
-                          onClick={() => void handleAddCustomSecret(word)}
-                          style={{ padding: "3px 8px", fontSize: "0.72rem" }}
-                        >
-                          <Plus size={11} /> Redact "{word}"
-                        </button>
-                      ))}
-                      {isCloudGatedByResidual && (
-                        <button
-                          type="button"
-                          onClick={() => setResidualOverrideAccepted(true)}
-                          style={{ padding: "3px 8px", fontSize: "0.72rem" }}
-                        >
-                          Allow & Unlock Cloud Audit
-                        </button>
-                      )}
-                    </div>
-                  </div>
+          {/* ================= TAB 1: AUDIT STUDIO & STRUCTURED REDLINES ================= */}
+          {activeTab === "audit" && (
+            <>
+              <h2>
+                <span>Verified Airlock & Hybrid Inference</span>
+                {verifiedPayload && (
+                  <span className="badge green">6/6 Firewall Checks Passed</span>
                 )}
+                {!verifiedPayload && airlockOut && (
+                  <span className="badge red">Gate 3 Firewall Blocked</span>
+                )}
+              </h2>
 
-                {/* CUSTOM SECRET VAULT */}
-                <div className="row" style={{ gap: 6, marginTop: 2 }}>
-                  <input
-                    type="text"
-                    value={customSecretDraft}
-                    onChange={(e) => setCustomSecretDraft(e.target.value)}
-                    onKeyDown={(e) => {
-                      if (e.key === "Enter") void handleAddCustomSecret(customSecretDraft);
-                    }}
-                    placeholder="Add custom secret phrase to local vault..."
-                    style={{
-                      flex: 1,
-                      minWidth: 180,
-                      background: "#0b1220",
-                      color: "var(--text)",
-                      border: "1px solid var(--border)",
-                      borderRadius: 6,
-                      padding: "5px 8px",
-                      fontSize: "0.75rem",
-                    }}
-                  />
-                  <button
-                    type="button"
-                    onClick={() => void handleAddCustomSecret(customSecretDraft)}
-                    disabled={customSecretDraft.trim().length < 3}
-                    style={{ padding: "5px 9px", fontSize: "0.72rem" }}
-                  >
-                    <Plus size={12} /> Redact Term
-                  </button>
-                </div>
+              {airlockOut ? (
+                <>
+                  {verifiedPayload ? (
+                    <div className="alert-green">
+                      <strong>SHA-256 Attestation Minted:</strong>{" "}
+                      <span className="mono">{verifiedPayload.receipt.receiptSha256.slice(0, 24)}…</span>{" "}
+                      | Redacted: <strong>{verifiedPayload.receipt.redactedCount}</strong> entities (Gate 1:{" "}
+                      {airlockOut.gate1Count}, Nano Gate 2: {airlockOut.gate2Count}
+                      {airlockOut.customCount > 0 ? `, Custom: ${airlockOut.customCount}` : ""})
+                    </div>
+                  ) : (
+                    <div className="alert-red">
+                      <strong>GATE 3 PRE-FLIGHT FIREWALL BLOCKED — 0 BYTES TRANSMITTED</strong>
+                      <div style={{ marginTop: 4, fontSize: "0.78rem" }}>
+                        {gate3BlockedViolations?.map((v, idx) => (
+                          <div key={idx} className="mono">
+                            • {v.vector} ({v.category}): {v.detail}
+                          </div>
+                        ))}
+                      </div>
+                    </div>
+                  )}
 
-                {customSecrets.length > 0 && (
-                  <div className="row" style={{ gap: 6 }}>
-                    <span className="muted" style={{ fontSize: "0.72rem" }}>Custom Vault Terms:</span>
-                    {customSecrets.map((term) => (
+                  {/* HIPAA SAFE HARBOR RISK METER + FAIL-CLOSED GUARD + CUSTOM VAULT */}
+                  <div className="wire-item" style={{ gap: 6 }}>
+                    <div className="row" style={{ justifyContent: "space-between" }}>
+                      <span style={{ fontWeight: 700, fontSize: "0.78rem" }}>
+                        Re-Identification & Safe Harbor Risk:{" "}
+                        <span
+                          className={`badge ${
+                            airlockOut.residualRisk.riskLevel === "LOW"
+                              ? "green"
+                              : airlockOut.residualRisk.riskLevel === "MODERATE"
+                                ? "amber"
+                                : "red"
+                          }`}
+                          style={{ marginLeft: 4 }}
+                        >
+                          {airlockOut.residualRisk.riskLevel}
+                        </span>
+                      </span>
                       <button
                         type="button"
-                        key={term}
-                        onClick={() => void handleRemoveCustomSecret(term)}
-                        style={{ padding: "2px 7px", fontSize: "0.7rem" }}
-                        title="Click to remove from custom vault"
+                        onClick={() => void handleToggleSafeHarbor()}
+                        style={{
+                          padding: "3px 8px",
+                          fontSize: "0.72rem",
+                          borderColor: strictSafeHarbor ? "#10b981" : undefined,
+                          color: strictSafeHarbor ? "#34d399" : undefined,
+                        }}
                       >
-                        {term} ×
+                        Strict Safe Harbor: {strictSafeHarbor ? "ON (URL/IP/ZIP/ID)" : "OFF"}
                       </button>
-                    ))}
+                    </div>
+
+                    <div className="muted" style={{ fontSize: "0.74rem" }}>
+                      {airlockOut.residualRisk.summary}
+                    </div>
+
+                    {airlockOut.residualRisk.residualProperNouns.length > 0 && (
+                      <div
+                        className={isCloudGatedByResidual ? "alert-red" : "wire-item"}
+                        style={{ padding: "8px 10px" }}
+                      >
+                        <div style={{ fontSize: "0.76rem", marginBottom: 6 }}>
+                          <strong>
+                            {isCloudGatedByResidual
+                              ? "FAIL-CLOSED GUARD ACTIVE (Non-Nano Mode):"
+                              : "Residual Proper Nouns Cleared:"}
+                          </strong>{" "}
+                          Click any flagged term to redact into local vault, or explicitly allow cloud send.
+                        </div>
+                        <div className="row" style={{ gap: 6 }}>
+                          {airlockOut.residualRisk.residualProperNouns.map((word) => (
+                            <button
+                              type="button"
+                              key={word}
+                              onClick={() => void handleAddCustomSecret(word)}
+                              style={{ padding: "3px 8px", fontSize: "0.72rem" }}
+                            >
+                              <Plus size={11} /> Redact "{word}"
+                            </button>
+                          ))}
+                          {isCloudGatedByResidual && (
+                            <button
+                              type="button"
+                              onClick={() => setResidualOverrideAccepted(true)}
+                              style={{ padding: "3px 8px", fontSize: "0.72rem" }}
+                            >
+                              Allow & Unlock Cloud Audit
+                            </button>
+                          )}
+                        </div>
+                      </div>
+                    )}
+
+                    <div className="row" style={{ gap: 6, marginTop: 2 }}>
+                      <input
+                        type="text"
+                        value={customSecretDraft}
+                        onChange={(e) => setCustomSecretDraft(e.target.value)}
+                        onKeyDown={(e) => {
+                          if (e.key === "Enter") void handleAddCustomSecret(customSecretDraft);
+                        }}
+                        placeholder="Add custom secret phrase to local vault..."
+                        style={{
+                          flex: 1,
+                          minWidth: 180,
+                          background: "#0b1220",
+                          color: "var(--text)",
+                          border: "1px solid var(--border)",
+                          borderRadius: 6,
+                          padding: "5px 8px",
+                          fontSize: "0.75rem",
+                        }}
+                      />
+                      <button
+                        type="button"
+                        onClick={() => void handleAddCustomSecret(customSecretDraft)}
+                        disabled={customSecretDraft.trim().length < 3}
+                        style={{ padding: "5px 9px", fontSize: "0.72rem" }}
+                      >
+                        <Plus size={12} /> Redact Term
+                      </button>
+                    </div>
+
+                    {customSecrets.length > 0 && (
+                      <div className="row" style={{ gap: 6 }}>
+                        <span className="muted" style={{ fontSize: "0.72rem" }}>Custom Vault Terms:</span>
+                        {customSecrets.map((term) => (
+                          <button
+                            type="button"
+                            key={term}
+                            onClick={() => void handleRemoveCustomSecret(term)}
+                            style={{ padding: "2px 7px", fontSize: "0.7rem" }}
+                            title="Click to remove from custom vault"
+                          >
+                            {term} ×
+                          </button>
+                        ))}
+                      </div>
+                    )}
                   </div>
-                )}
+
+                  {/* SANITIZED SKELETON PREVIEW WITH CLOUD TOKEN CHIPS */}
+                  <div className="row" style={{ justifyContent: "space-between", alignItems: "center" }}>
+                    <span className="muted">
+                      {verifiedPayload
+                        ? "Sanitized Skeleton (Only blue placeholder tokens cross the network):"
+                        : "Blocked Staging Buffer (0 bytes allowed on wire):"}
+                    </span>
+                    <button
+                      type="button"
+                      onClick={handleDownloadScrubbedText}
+                      disabled={!verifiedPayload}
+                      style={{ padding: "4px 8px", fontSize: "0.72rem" }}
+                    >
+                      <FileText size={12} /> Download Scrubbed Copy (.txt)
+                    </button>
+                  </div>
+                  <div className="codebox" style={{ whiteSpace: "pre-wrap" }}>
+                    <ZeroKnowledgeText
+                      sanitizedText={
+                        verifiedPayload ? verifiedPayload.sanitizedText : airlockOut.candidateSanitized
+                      }
+                      entries={vaultEntries}
+                      viewMode="cloud"
+                    />
+                  </div>
+
+                  {/* HYBRID INFERENCE ACTIONS */}
+                  <div className="row">
+                    <button
+                      type="button"
+                      onClick={handleQueueOfflineReceipt}
+                      disabled={busy !== null || !verifiedPayload}
+                    >
+                      <WifiOff size={14} />
+                      Queue Offline Receipt (0B)
+                    </button>
+                    <button
+                      type="button"
+                      onClick={handleOfflineTriage}
+                      disabled={
+                        busy !== null || !verifiedPayload || !isFirebaseConfigured || isCloudGatedByResidual
+                      }
+                    >
+                      <Zap size={14} />
+                      {busy === "triage" ? "Triaging..." : "Offline Triage"}
+                    </button>
+                    <button
+                      type="button"
+                      className="cloud"
+                      onClick={() => void handleCloudAudit("STRUCTURED_JSON")}
+                      disabled={
+                        busy !== null ||
+                        !verifiedPayload ||
+                        !isOnline ||
+                        !isFirebaseConfigured ||
+                        isCloudGatedByResidual
+                      }
+                    >
+                      <FileJson size={14} />
+                      {busy === "cloud-json"
+                        ? "Generating Redlines..."
+                        : !verifiedPayload
+                          ? "Cloud Locked (Gate 3 Blocked)"
+                          : isCloudGatedByResidual
+                            ? "Cloud Locked (Review Flagged Terms)"
+                            : "Structured JSON Redlines (Schema)"}
+                    </button>
+                    <button
+                      type="button"
+                      onClick={() => void handleCloudAudit("SERVER_TEMPLATE")}
+                      disabled={
+                        busy !== null ||
+                        !verifiedPayload ||
+                        !isOnline ||
+                        !isFirebaseConfigured ||
+                        isCloudGatedByResidual
+                      }
+                    >
+                      <Cloud size={14} />
+                      {busy === "cloud" ? "Running Template..." : "Server Template Audit"}
+                    </button>
+                  </div>
+
+                  {queueStatusMsg && (
+                    <div
+                      className="wire-item"
+                      style={{
+                        flexDirection: "row",
+                        justifyContent: "space-between",
+                        alignItems: "center",
+                        fontSize: "0.75rem",
+                        color: "#fbbf24",
+                      }}
+                    >
+                      <span>{queueStatusMsg}</span>
+                      <button
+                        type="button"
+                        onClick={() => setActiveTab("ledger")}
+                        style={{ padding: "3px 8px", fontSize: "0.72rem" }}
+                      >
+                        Open Ledger Tab →
+                      </button>
+                    </div>
+                  )}
+
+                  {triageOut && (
+                    <div className="wire-item">
+                      <div className="row" style={{ justifyContent: "space-between" }}>
+                        <strong>
+                          Quick Triage: {triageOut.documentType} ({triageOut.quickRiskLevel})
+                        </strong>
+                        <span
+                          className={`badge ${
+                            triageOut.inferenceSource === "ON_DEVICE" ? "green" : "blue"
+                          }`}
+                        >
+                          {triageOut.inferenceSource} · {triageOut.latencyMs} ms
+                        </span>
+                      </div>
+                      <div style={{ fontSize: "0.82rem", marginTop: 4 }}>
+                        <ZeroKnowledgeText
+                          sanitizedText={triageOut.oneLineSummary}
+                          entries={vaultEntries}
+                          viewMode={zkViewMode}
+                        />
+                      </div>
+                    </div>
+                  )}
+
+                  {/* CLOUD AUDIT OUTPUT WITH ZERO-KNOWLEDGE DIFF HIGHLIGHTER & REDLINE CARDS */}
+                  {cloudOut && (
+                    <div style={{ borderTop: "1px solid var(--border)", paddingTop: 12 }}>
+                      <div
+                        className="row"
+                        style={{ justifyContent: "space-between", alignItems: "center", marginBottom: 10 }}
+                      >
+                        <div>
+                          <strong>
+                            {cloudOut.mode === "STRUCTURED_JSON"
+                              ? "Structured JSON Redlines (Firebase AI Schema)"
+                              : `Server Template Audit (${
+                                  cloudOut.usedServerTemplate ? cloudOut.templateId : "ONLY_IN_CLOUD"
+                                })`}
+                          </strong>{" "}
+                          <span className="muted mono" style={{ fontSize: "0.74rem" }}>
+                            · {cloudOut.latencyMs} ms · IN_CLOUD
+                          </span>
+                        </div>
+
+                        <div className="row" style={{ gap: 5 }}>
+                          {(
+                            [
+                              { id: "diff", label: "Zero-Knowledge Diff" },
+                              { id: "rehydrated", label: "Clean Re-Hydrated" },
+                              { id: "cloud", label: "What Cloud Saw" },
+                            ] as const
+                          ).map((modeBtn) => (
+                            <button
+                              type="button"
+                              key={modeBtn.id}
+                              onClick={() => setZkViewMode(modeBtn.id)}
+                              style={{
+                                padding: "4px 8px",
+                                fontSize: "0.71rem",
+                                borderColor: zkViewMode === modeBtn.id ? "#10b981" : undefined,
+                                color: zkViewMode === modeBtn.id ? "#34d399" : undefined,
+                              }}
+                            >
+                              {modeBtn.label}
+                            </button>
+                          ))}
+                        </div>
+                      </div>
+
+                      {zkViewMode === "diff" && (
+                        <div className="muted" style={{ fontSize: "0.72rem", marginBottom: 8 }}>
+                          Emerald pills (<span className="zk-chip zk-chip-local">Local Value<span className="zk-chip-tag">[TOKEN]</span></span>) were restored strictly in browser RAM — <strong>0 bytes</strong> of those secrets reached Gemini.
+                        </div>
+                      )}
+
+                      {cloudOut.structured ? (
+                        <div style={{ display: "flex", flexDirection: "column", gap: 10 }}>
+                          <div className="wire-item">
+                            <div className="row" style={{ justifyContent: "space-between" }}>
+                              <strong>Executive Summary</strong>
+                              <span
+                                className={`badge ${
+                                  cloudOut.structured.overallRiskLevel === "CRITICAL" ||
+                                  cloudOut.structured.overallRiskLevel === "HIGH"
+                                    ? "red"
+                                    : cloudOut.structured.overallRiskLevel === "MEDIUM"
+                                      ? "amber"
+                                      : "green"
+                                }`}
+                              >
+                                OVERALL RISK: {cloudOut.structured.overallRiskLevel}
+                              </span>
+                            </div>
+                            <div style={{ fontSize: "0.82rem", lineHeight: 1.5, marginTop: 4 }}>
+                              <ZeroKnowledgeText
+                                sanitizedText={cloudOut.structured.executiveSummary}
+                                entries={vaultEntries}
+                                viewMode={zkViewMode}
+                              />
+                            </div>
+                          </div>
+
+                          {cloudOut.structured.clauses.map((clause, idx) => (
+                            <div key={idx} className="redline-card">
+                              <div className="row" style={{ justifyContent: "space-between" }}>
+                                <strong style={{ fontSize: "0.86rem" }}>
+                                  #{idx + 1} {clause.clauseTitle}
+                                </strong>
+                                <div className="row" style={{ gap: 6 }}>
+                                  <span
+                                    className={`badge ${
+                                      clause.severity === "CRITICAL" || clause.severity === "HIGH"
+                                        ? "red"
+                                        : clause.severity === "MEDIUM"
+                                          ? "amber"
+                                          : "green"
+                                    }`}
+                                  >
+                                    {clause.severity}
+                                  </span>
+                                  <button
+                                    type="button"
+                                    onClick={() =>
+                                      handleCopyRedline(idx, clause.redlineCounterProposal)
+                                    }
+                                    style={{ padding: "3px 8px", fontSize: "0.7rem" }}
+                                  >
+                                    {copiedClauseIdx === idx ? (
+                                      <>
+                                        <Check size={11} /> Copied
+                                      </>
+                                    ) : (
+                                      <>
+                                        <Copy size={11} /> Copy Redline
+                                      </>
+                                    )}
+                                  </button>
+                                </div>
+                              </div>
+
+                              <div style={{ fontSize: "0.8rem", lineHeight: 1.45 }}>
+                                <ZeroKnowledgeText
+                                  sanitizedText={clause.issue}
+                                  entries={vaultEntries}
+                                  viewMode={zkViewMode}
+                                />
+                              </div>
+
+                              {clause.quotedExcerpt && (
+                                <div className="redline-excerpt">
+                                  <strong>Flagged Excerpt:</strong>{" "}
+                                  <ZeroKnowledgeText
+                                    sanitizedText={clause.quotedExcerpt}
+                                    entries={vaultEntries}
+                                    viewMode={zkViewMode}
+                                  />
+                                </div>
+                              )}
+
+                              <div className="redline-proposal">
+                                <strong style={{ color: "#34d399" }}>Redline Counter-Proposal:</strong>{" "}
+                                <ZeroKnowledgeText
+                                  sanitizedText={clause.redlineCounterProposal}
+                                  entries={vaultEntries}
+                                  viewMode={zkViewMode}
+                                />
+                              </div>
+                            </div>
+                          ))}
+                        </div>
+                      ) : (
+                        <div className="codebox" style={{ whiteSpace: "pre-wrap" }}>
+                          <ZeroKnowledgeText
+                            sanitizedText={cloudOut.sanitizedMarkdown}
+                            entries={vaultEntries}
+                            viewMode={zkViewMode}
+                          />
+                        </div>
+                      )}
+                    </div>
+                  )}
+                </>
+              ) : (
+                <div className="muted" style={{ padding: "12px 0" }}>
+                  Click <strong>Run Local Airlock</strong> on the left to execute Gate 1 (deterministic +
+                  Shannon entropy + offline NER), guarded Gate 2 (Gemini Nano on-device), and Gate 3
+                  (6-vector firewall), then run <strong>Structured JSON Redlines</strong> or{" "}
+                  <strong>Server Template Audit</strong> with inline Zero-Knowledge Diff highlighting.
+                </div>
+              )}
+            </>
+          )}
+
+          {/* ================= TAB 2: RED-TEAM LAB, WIRE TAP & HYBRID ROUTING ================= */}
+          {activeTab === "redteam" && (
+            <>
+              {/* ADAPTIVE HYBRID ROUTING VISUALIZER + ENTERPRISE ROI METER */}
+              <div className="wire-item" style={{ gap: 8 }}>
+                <div className="row" style={{ justifyContent: "space-between" }}>
+                  <strong style={{ fontSize: "0.84rem" }}>
+                    Adaptive Hybrid Routing Architecture & Offload ROI
+                  </strong>
+                  <span className="badge green">Firebase AI Logic + SDK #10635 Guard</span>
+                </div>
+
+                <div className="route-grid">
+                  <div className="route-node local">
+                    <div className="row" style={{ justifyContent: "space-between" }}>
+                      <strong style={{ fontSize: "0.76rem" }}>1. Local Airlock</strong>
+                      <span className="badge green" style={{ fontSize: "0.64rem" }}>0B · $0</span>
+                    </div>
+                    <div className="mono muted" style={{ fontSize: "0.68rem" }}>
+                      ONLY_ON_DEVICE (Guarded)
+                    </div>
+                    <div className="muted" style={{ fontSize: "0.72rem" }}>
+                      PDF/PNG pixel redaction + 6-vector firewall. Nano: {nanoStatus.toUpperCase()}.
+                    </div>
+                  </div>
+
+                  <div className="route-node hybrid">
+                    <div className="row" style={{ justifyContent: "space-between" }}>
+                      <strong style={{ fontSize: "0.76rem" }}>2. Offline Triage</strong>
+                      <span className="badge amber" style={{ fontSize: "0.64rem" }}>HYBRID</span>
+                    </div>
+                    <div className="mono muted" style={{ fontSize: "0.68rem" }}>
+                      PREFER_ON_DEVICE
+                    </div>
+                    <div className="muted" style={{ fontSize: "0.72rem" }}>
+                      Runs Nano offline; falls back cleanly to cloud ONLY on verified skeletons.
+                    </div>
+                  </div>
+
+                  <div className="route-node cloud">
+                    <div className="row" style={{ justifyContent: "space-between" }}>
+                      <strong style={{ fontSize: "0.76rem" }}>3. Deep Redlines</strong>
+                      <span className="badge blue" style={{ fontSize: "0.64rem" }}>SKELETON</span>
+                    </div>
+                    <div className="mono muted" style={{ fontSize: "0.68rem" }}>
+                      ONLY_IN_CLOUD / Templates
+                    </div>
+                    <div className="muted" style={{ fontSize: "0.72rem" }}>
+                      Server Prompt Templates + JSON Schema on zero-PII tokens; re-hydrated in RAM.
+                    </div>
+                  </div>
+                </div>
+
+                <div style={{ marginTop: 4 }}>
+                  <div className="row" style={{ justifyContent: "space-between", fontSize: "0.75rem" }}>
+                    <span className="muted">
+                      Enterprise Volume Simulator: <strong>{monthlyDocsVolume.toLocaleString()} docs/mo</strong>
+                    </span>
+                    <span className="mono muted">{entitiesPerDoc} PII entities/doc baseline</span>
+                  </div>
+                  <input
+                    type="range"
+                    min={100}
+                    max={10000}
+                    step={100}
+                    value={monthlyDocsVolume}
+                    onChange={(e) => setMonthlyDocsVolume(Number(e.target.value))}
+                    style={{ width: "100%", accentColor: "#10b981", marginTop: 4 }}
+                  />
+                  <div className="roi-grid">
+                    <div className="roi-stat">
+                      <div className="muted" style={{ fontSize: "0.68rem" }}>Raw Secrets Shielded / mo</div>
+                      <div className="roi-val">{rawPiiShieldedPerMonth.toLocaleString()}</div>
+                    </div>
+                    <div className="roi-stat">
+                      <div className="muted" style={{ fontSize: "0.68rem" }}>Cloud Tokens Offloaded / mo</div>
+                      <div className="roi-val">{cloudTokensOffloadedPerMonth.toLocaleString()}</div>
+                    </div>
+                    <div className="roi-stat">
+                      <div className="muted" style={{ fontSize: "0.68rem" }}>Est. DLP/API Spend Saved</div>
+                      <div className="roi-val">${monthlySpendAvoidedUsd.toLocaleString()}/mo</div>
+                    </div>
+                  </div>
+                </div>
               </div>
 
-              <div className="row" style={{ justifyContent: "space-between", alignItems: "center" }}>
-                <span className="muted">
-                  {verifiedPayload
-                    ? "Sanitized Skeleton (Only this crosses the network):"
-                    : "Blocked Staging Buffer (0 bytes allowed on wire):"}
-                </span>
-                <button
-                  type="button"
-                  onClick={handleDownloadScrubbedText}
-                  disabled={!verifiedPayload}
-                  style={{ padding: "4px 8px", fontSize: "0.72rem" }}
-                >
-                  <FileText size={12} /> Download Scrubbed Copy (.txt)
-                </button>
-              </div>
-              <div className="codebox">
-                {verifiedPayload ? verifiedPayload.sanitizedText : airlockOut.candidateSanitized}
-              </div>
-
-              <div className="row">
-                <button
-                  type="button"
-                  onClick={handleQueueOfflineReceipt}
-                  disabled={busy !== null || !verifiedPayload}
-                >
-                  <WifiOff size={15} />
-                  Queue Offline Receipt (0B Cloud)
-                </button>
-                <button
-                  type="button"
-                  onClick={handleOfflineTriage}
-                  disabled={busy !== null || !verifiedPayload || !isFirebaseConfigured || isCloudGatedByResidual}
-                >
-                  <Zap size={15} />
-                  {busy === "triage" ? "Triaging..." : "Offline Triage (PREFER_ON_DEVICE)"}
-                </button>
-                <button
-                  type="button"
-                  className="cloud"
-                  onClick={handleCloudAudit}
-                  disabled={
-                    busy !== null ||
-                    !verifiedPayload ||
-                    !isOnline ||
-                    !isFirebaseConfigured ||
-                    isCloudGatedByResidual
-                  }
-                >
-                  <Cloud size={15} />
-                  {busy === "cloud"
-                    ? "Auditing in Cloud..."
-                    : !verifiedPayload
-                      ? "Cloud Locked (Gate 3 Firewall Blocked)"
-                      : isCloudGatedByResidual
-                        ? "Cloud Locked (Review Flagged Terms)"
-                        : "Deep Cloud Audit (Server Template)"}
-                </button>
-              </div>
-
-              {/* RED-TEAM ATTACK LAB: CLIENT GATE 3 + SERVER LAYER 4 */}
+              {/* LIVE RED-TEAM ATTACK LAB: CLIENT GATE 3 + SERVER LAYER 4 */}
               <div style={{ borderTop: "1px solid var(--border)", paddingTop: 10 }}>
                 <div className="muted" style={{ marginBottom: 6 }}>
                   <ShieldAlert size={14} style={{ verticalAlign: "middle" }} />{" "}
-                  <strong>Live Red-Team Attack Lab</strong> (Layer 3 Client Firewall):
+                  <strong>Layer-3 Client Firewall Attack Lab</strong>{" "}
+                  {!airlockOut && "(Run Local Airlock first to enable)"}
                 </div>
                 <div className="row">
-                  <button type="button" className="danger" onClick={() => handleRedTeamAttack("MISSED_ENTITY_ESCAPE")}>
+                  <button
+                    type="button"
+                    className="danger"
+                    disabled={!airlockOut}
+                    onClick={() => handleRedTeamAttack("MISSED_ENTITY_ESCAPE")}
+                  >
                     Missed Entity
                   </button>
-                  <button type="button" className="danger" onClick={() => handleRedTeamAttack("BASE64_EXFILTRATION")}>
+                  <button
+                    type="button"
+                    className="danger"
+                    disabled={!airlockOut}
+                    onClick={() => handleRedTeamAttack("BASE64_EXFILTRATION")}
+                  >
                     Base64 Exfil
                   </button>
-                  <button type="button" className="danger" onClick={() => handleRedTeamAttack("CANARY_PROMPT_INJECTION")}>
+                  <button
+                    type="button"
+                    className="danger"
+                    disabled={!airlockOut}
+                    onClick={() => handleRedTeamAttack("CANARY_PROMPT_INJECTION")}
+                  >
                     Canary Injection
                   </button>
-                  <button type="button" className="danger" onClick={() => handleRedTeamAttack("ZERO_WIDTH_SMUGGLING")}>
+                  <button
+                    type="button"
+                    className="danger"
+                    disabled={!airlockOut}
+                    onClick={() => handleRedTeamAttack("ZERO_WIDTH_SMUGGLING")}
+                  >
                     Zero-Width Smuggle
                   </button>
                 </div>
 
-                <div className="muted" style={{ marginTop: 8, marginBottom: 6 }}>
+                <div className="muted" style={{ marginTop: 10, marginBottom: 6 }}>
                   <Lock size={13} style={{ verticalAlign: "middle" }} />{" "}
-                  <strong>Layer-4 Server Attack</strong> (Bypass Client → Attack Live Firestore Rules):
+                  <strong>Layer-4 Live Firestore Rules Attack</strong> (Bypass Client → Attack Cloud Server):
                 </div>
                 <div className="row">
                   <button
@@ -1286,293 +1626,383 @@ export default function App() {
                     {busy === "layer4-LEDGER_DELETE" ? "Attacking..." : "Delete Receipt"}
                   </button>
                 </div>
+
+                {redTeamBlock && (
+                  <div className="alert-red" style={{ marginTop: 8 }}>
+                    <strong>FIREWALL TRIPPED — 0 BYTES TRANSMITTED</strong> ({redTeamBlock.blockedBytes}B
+                    aborted before fetch)
+                    <div>
+                      Attack: <span className="mono">{redTeamBlock.attack}</span> | Vector:{" "}
+                      <span className="mono">{redTeamBlock.violations[0]?.vector}</span> —{" "}
+                      {redTeamBlock.violations[0]?.detail}
+                    </div>
+                  </div>
+                )}
+
+                {layer4Result && (
+                  <div
+                    className={layer4Result.blockedByRules ? "alert-green" : "alert-red"}
+                    style={{ marginTop: 8 }}
+                  >
+                    <strong>
+                      {layer4Result.blockedByRules
+                        ? `LAYER-4 SERVER DEFENSE HELD — ${layer4Result.errorCode.toUpperCase()}`
+                        : `LAYER-4 CHECK FAILED (${layer4Result.errorCode})`}
+                    </strong>{" "}
+                    ({layer4Result.latencyMs} ms)
+                    <div className="mono" style={{ fontSize: "0.75rem", marginTop: 2 }}>
+                      {layer4Result.ruleEnforced}
+                    </div>
+                    <div style={{ fontSize: "0.8rem" }}>{layer4Result.detail}</div>
+                  </div>
+                )}
               </div>
 
-              {redTeamBlock && (
-                <div className="alert-red">
-                  <strong>FIREWALL TRIPPED — 0 BYTES TRANSMITTED</strong> ({redTeamBlock.blockedBytes}B
-                  aborted before fetch)
-                  <div>
-                    Attack: <span className="mono">{redTeamBlock.attack}</span> | Vector:{" "}
-                    <span className="mono">{redTeamBlock.violations[0]?.vector}</span> —{" "}
-                    {redTeamBlock.violations[0]?.detail}
-                  </div>
-                </div>
-              )}
-
-              {layer4Result && (
-                <div className={layer4Result.blockedByRules ? "alert-green" : "alert-red"}>
+              {/* LIVE WIRE TAP */}
+              <div style={{ borderTop: "1px solid var(--border)", paddingTop: 10 }}>
+                <div className="row" style={{ justifyContent: "space-between", marginBottom: 8 }}>
                   <strong>
-                    {layer4Result.blockedByRules
-                      ? `LAYER-4 SERVER DEFENSE HELD — ${layer4Result.errorCode.toUpperCase()}`
-                      : `LAYER-4 CHECK FAILED (${layer4Result.errorCode})`}
-                  </strong>{" "}
-                  ({layer4Result.latencyMs} ms)
-                  <div className="mono" style={{ fontSize: "0.75rem", marginTop: 2 }}>
-                    {layer4Result.ruleEnforced}
-                  </div>
-                  <div style={{ fontSize: "0.8rem" }}>{layer4Result.detail}</div>
-                </div>
-              )}
-
-              {triageOut && (
-                <div className="wire-item">
-                  <div className="row" style={{ justifyContent: "space-between" }}>
-                    <strong>Quick Triage: {triageOut.documentType} ({triageOut.quickRiskLevel})</strong>
-                    <span className={`badge ${triageOut.inferenceSource === "ON_DEVICE" ? "green" : "blue"}`}>
-                      {triageOut.inferenceSource} · {triageOut.latencyMs} ms
-                    </span>
-                  </div>
-                  <div>{triageOut.oneLineSummary}</div>
-                </div>
-              )}
-
-              {cloudOut && (
-                <div style={{ borderTop: "1px solid var(--border)", paddingTop: 10 }}>
-                  <div className="row" style={{ justifyContent: "space-between", marginBottom: 8 }}>
-                    <strong>
-                      Cloud Audit ({cloudOut.usedServerTemplate ? cloudOut.templateId : "ONLY_IN_CLOUD"}) ·{" "}
-                      {cloudOut.latencyMs} ms
-                    </strong>
-                    <button type="button" onClick={() => setShowRehydrated((v) => !v)}>
-                      {showRehydrated ? <Eye size={14} /> : <EyeOff size={14} />}
-                      {showRehydrated ? "Showing Local Re-Hydrated" : "Showing What Cloud Saw"}
-                    </button>
-                  </div>
-                  <div className="codebox">
-                    {showRehydrated ? cloudOut.rehydratedMarkdown : cloudOut.sanitizedMarkdown}
-                  </div>
-                </div>
-              )}
-            </>
-          ) : (
-            <div className="muted">
-              Click <strong>Run Local Airlock</strong> on the left to execute Gate 1 (deterministic +
-              Shannon entropy + offline NER), guarded Gate 2 (Gemini Nano on-device), and Gate 3
-              (6-vector firewall).
-            </div>
-          )}
-        </section>
-
-        {/* RIGHT COLUMN: LIVE WIRE TAP, OFFLINE-SYNC LEDGER & ZERO-TRUST EXTERNAL PROOF AUDITOR */}
-        <section className="card">
-          <h2>
-            <span>
-              <Activity size={16} style={{ verticalAlign: "middle", marginRight: 6 }} />
-              3. Live Wire Tap (Proof of Zero Leakage)
-            </span>
-            <button type="button" onClick={() => wireTap.clear()} style={{ padding: "4px 8px", fontSize: "0.72rem" }}>
-              Clear
-            </button>
-          </h2>
-
-          <div style={{ display: "flex", flexDirection: "column", gap: 8, maxHeight: 300, overflowY: "auto" }}>
-            {wireEvents.length === 0 ? (
-              <div className="muted">No telemetry yet. Run Local Airlock to observe 0-byte local processing.</div>
-            ) : (
-              wireEvents.map((ev) => (
-                <div key={ev.id} className="wire-item">
-                  <div className="row" style={{ justifyContent: "space-between" }}>
-                    <span className="mono" style={{ fontWeight: 700 }}>{ev.stage}</span>
-                    <span
-                      className={`badge ${
-                        ev.inferenceSource === "BLOCKED"
-                          ? "red"
-                          : ev.inferenceSource === "IN_CLOUD"
-                            ? "blue"
-                            : "green"
-                      }`}
-                    >
-                      {ev.inferenceSource} · {ev.bytesSent}B · {ev.latencyMs}ms
-                    </span>
-                  </div>
-                  {ev.endpoint && <div className="muted mono">{ev.endpoint}</div>}
-                  <div className="mono" style={{ fontSize: "0.72rem", color: "#cbd5e1", wordBreak: "break-word" }}>
-                    {ev.payloadPreview}
-                  </div>
-                </div>
-              ))
-            )}
-          </div>
-
-          <div style={{ borderTop: "1px solid var(--border)", paddingTop: 12 }}>
-            <div className="row" style={{ justifyContent: "space-between", alignItems: "center", marginBottom: 8 }}>
-              <h2 style={{ margin: 0 }}>Firestore Zero-PII Audit Ledger</h2>
-              <div className="row" style={{ gap: 6 }}>
-                {pendingQueue.length > 0 && (
+                    <Activity size={15} style={{ verticalAlign: "middle", marginRight: 6 }} />
+                    Live Wire Tap (Proof of Zero Leakage)
+                  </strong>
                   <button
                     type="button"
-                    className="cloud"
-                    onClick={() => void runQueueFlush("manual")}
-                    disabled={busy !== null || !isOnline || !isFirebaseConfigured}
+                    onClick={() => wireTap.clear()}
                     style={{ padding: "4px 8px", fontSize: "0.72rem" }}
                   >
-                    <RefreshCw size={12} /> Flush Queue ({pendingQueue.length})
+                    Clear
                   </button>
-                )}
-                <button
-                  type="button"
-                  onClick={() => handleVerifyChain(false)}
-                  disabled={combinedLedger.length === 0}
-                  style={{ padding: "4px 8px", fontSize: "0.72rem" }}
-                >
-                  Verify Chain
-                </button>
-                <button
-                  type="button"
-                  className="danger"
-                  onClick={() => handleVerifyChain(true)}
-                  disabled={combinedLedger.length === 0}
-                  style={{ padding: "4px 8px", fontSize: "0.72rem" }}
-                >
-                  1-Byte Tamper
-                </button>
-                <button
-                  type="button"
-                  onClick={handleExportProofBundle}
-                  disabled={combinedLedger.length === 0 && !verifiedPayload}
-                  style={{ padding: "4px 8px", fontSize: "0.72rem" }}
-                >
-                  <Download size={12} /> Proof JSON
-                </button>
-              </div>
-            </div>
+                </div>
 
-            {queueStatusMsg && (
-              <div className="wire-item" style={{ marginBottom: 8, fontSize: "0.75rem", color: "#fbbf24" }}>
-                {queueStatusMsg}
+                <div style={{ display: "flex", flexDirection: "column", gap: 8, maxHeight: 320, overflowY: "auto" }}>
+                  {wireEvents.length === 0 ? (
+                    <div className="muted">
+                      No telemetry yet. Run Local Airlock to observe 0-byte local processing.
+                    </div>
+                  ) : (
+                    wireEvents.map((ev) => (
+                      <div key={ev.id} className="wire-item">
+                        <div className="row" style={{ justifyContent: "space-between" }}>
+                          <span className="mono" style={{ fontWeight: 700 }}>{ev.stage}</span>
+                          <span
+                            className={`badge ${
+                              ev.inferenceSource === "BLOCKED"
+                                ? "red"
+                                : ev.inferenceSource === "IN_CLOUD"
+                                  ? "blue"
+                                  : "green"
+                            }`}
+                          >
+                            {ev.inferenceSource} · {ev.bytesSent}B · {ev.latencyMs}ms
+                          </span>
+                        </div>
+                        {ev.endpoint && <div className="muted mono">{ev.endpoint}</div>}
+                        <div
+                          className="mono"
+                          style={{ fontSize: "0.72rem", color: "#cbd5e1", wordBreak: "break-word" }}
+                        >
+                          {ev.payloadPreview}
+                        </div>
+                      </div>
+                    ))
+                  )}
+                </div>
               </div>
-            )}
+            </>
+          )}
 
-            {chainReport && (
-              <div
-                className={chainReport.ok ? "alert-green" : "alert-red"}
-                style={{ marginBottom: 8, fontSize: "0.78rem" }}
-              >
-                <div>{chainReport.detail}</div>
-                {isTamperSimulated && (
+          {/* ================= TAB 3: LEDGER, ENCRYPTED VAULT & PROOF AUDITOR ================= */}
+          {activeTab === "ledger" && (
+            <>
+              {/* FIRESTORE ZERO-PII HASH-CHAINED LEDGER + OFFLINE SYNC QUEUE */}
+              <div className="row" style={{ justifyContent: "space-between", alignItems: "center" }}>
+                <h2 style={{ margin: 0 }}>Firestore Zero-PII Audit Ledger</h2>
+                <div className="row" style={{ gap: 6 }}>
+                  {pendingQueue.length > 0 && (
+                    <button
+                      type="button"
+                      className="cloud"
+                      onClick={() => void runQueueFlush("manual")}
+                      disabled={busy !== null || !isOnline || !isFirebaseConfigured}
+                      style={{ padding: "4px 8px", fontSize: "0.72rem" }}
+                    >
+                      <RefreshCw size={12} /> Flush Queue ({pendingQueue.length})
+                    </button>
+                  )}
                   <button
                     type="button"
                     onClick={() => handleVerifyChain(false)}
-                    style={{ marginTop: 6, padding: "3px 8px", fontSize: "0.72rem" }}
+                    disabled={combinedLedger.length === 0}
+                    style={{ padding: "4px 8px", fontSize: "0.72rem" }}
                   >
-                    Restore Authentic Chain & Re-Verify
+                    Verify Chain
                   </button>
-                )}
+                  <button
+                    type="button"
+                    className="danger"
+                    onClick={() => handleVerifyChain(true)}
+                    disabled={combinedLedger.length === 0}
+                    style={{ padding: "4px 8px", fontSize: "0.72rem" }}
+                  >
+                    1-Byte Tamper
+                  </button>
+                  <button
+                    type="button"
+                    onClick={handleExportProofBundle}
+                    disabled={combinedLedger.length === 0 && !verifiedPayload}
+                    style={{ padding: "4px 8px", fontSize: "0.72rem" }}
+                  >
+                    <Download size={12} /> Proof JSON
+                  </button>
+                </div>
               </div>
-            )}
 
-            {combinedLedger.length === 0 ? (
-              <div className="muted">
-                Append-only SHA-256 receipts sync here after your first Cloud Audit or Offline Queue entry.
-              </div>
-            ) : (
-              <div style={{ display: "flex", flexDirection: "column", gap: 6 }}>
-                {combinedLedger.map((item, idx) => {
-                  const isExpanded = expandedDocId === item.docId;
-                  const isPending = item.syncStatus === "PENDING_SYNC";
-                  return (
-                    <div
-                      key={item.docId || item.receiptSha256}
-                      className="wire-item"
-                      onClick={() => setExpandedDocId(isExpanded ? null : item.docId)}
-                      style={{ cursor: "pointer" }}
-                      title="Click to inspect full SHA-256 hash chain receipt"
-                    >
-                      <div className="row" style={{ justifyContent: "space-between" }}>
-                        <strong>
-                          #{combinedLedger.length - idx} {item.policyProfile} · {item.riskLevel}
-                        </strong>
-                        <div className="row" style={{ gap: 6 }}>
-                          <span className={`badge ${isPending ? "amber" : "green"}`} style={{ padding: "2px 7px", fontSize: "0.66rem" }}>
-                            {isPending ? "PENDING_SYNC" : "SYNCED"}
-                          </span>
-                          <span className="mono muted">{item.receiptSha256.slice(0, 14)}…</span>
-                        </div>
-                      </div>
-                      <div className="muted">{item.sanitizedSummary}</div>
-                      <div className="mono muted" style={{ fontSize: "0.7rem", marginTop: 2 }}>
-                        prev:{" "}
-                        {item.prevReceiptSha256
-                          ? `${item.prevReceiptSha256.slice(0, 14)}…`
-                          : "GENESIS (null)"}
-                        {" · "}
-                        {isExpanded ? "hide details ▲" : "inspect hashes ▼"}
-                      </div>
-
-                      {isExpanded && (
-                        <div
-                          className="mono"
-                          style={{
-                            marginTop: 6,
-                            paddingTop: 6,
-                            borderTop: "1px solid var(--border)",
-                            fontSize: "0.68rem",
-                            color: "#cbd5e1",
-                            wordBreak: "break-all",
-                            display: "flex",
-                            flexDirection: "column",
-                            gap: 2,
-                          }}
-                        >
-                          <div>docId: {item.docId}</div>
-                          <div>timestamp: {item.timestampIso}</div>
-                          <div>receiptSha256: {item.receiptSha256}</div>
-                          <div>prevReceiptSha256: {item.prevReceiptSha256 ?? "null"}</div>
-                          <div>rawDocSha256: {item.rawDocSha256}</div>
-                          <div>sanitizedPayloadSha256: {item.sanitizedPayloadSha256}</div>
-                          <div>
-                            firewall: {item.checksPassed}/6 ({item.inferenceSource})
-                          </div>
-                        </div>
-                      )}
-                    </div>
-                  );
-                })}
-              </div>
-            )}
-
-            {/* ZERO-TRUST EXTERNAL PROOF JSON AUDITOR (100% OFFLINE) */}
-            <div style={{ borderTop: "1px solid var(--border)", paddingTop: 10, marginTop: 12 }}>
-              <div className="row" style={{ justifyContent: "space-between", alignItems: "center" }}>
-                <span className="muted" style={{ fontSize: "0.76rem" }}>
-                  <FileCheck2 size={13} style={{ verticalAlign: "middle", marginRight: 5 }} />
-                  <strong>Zero-Trust External Proof Auditor</strong> (Offline)
-                </span>
-                <label
-                  style={{
-                    cursor: "pointer",
-                    fontSize: "0.72rem",
-                    padding: "4px 8px",
-                    borderRadius: 6,
-                    border: "1px solid var(--border)",
-                    background: "var(--panel-alt)",
-                    fontWeight: 600,
-                  }}
-                >
-                  Verify Proof JSON File
-                  <input
-                    type="file"
-                    accept=".json,application/json"
-                    onChange={(e) => void handleAuditExternalProofFile(e)}
-                    style={{ display: "none" }}
-                  />
-                </label>
-              </div>
-              {externalProofReport && (
-                <div
-                  className={externalProofReport.ok ? "alert-green" : "alert-red"}
-                  style={{ marginTop: 8, fontSize: "0.75rem" }}
-                >
-                  <div><strong>{externalProofReport.verdict}</strong></div>
-                  <div className="mono" style={{ fontSize: "0.7rem", marginTop: 3 }}>
-                    file: {externalProofReport.fileName} · project: {externalProofReport.projectId} · zeroPii:{" "}
-                    {String(externalProofReport.zeroPiiClean)}
-                  </div>
+              {queueStatusMsg && (
+                <div className="wire-item" style={{ fontSize: "0.75rem", color: "#fbbf24" }}>
+                  {queueStatusMsg}
                 </div>
               )}
-            </div>
-          </div>
+
+              {chainReport && (
+                <div
+                  className={chainReport.ok ? "alert-green" : "alert-red"}
+                  style={{ fontSize: "0.78rem" }}
+                >
+                  <div>{chainReport.detail}</div>
+                  {isTamperSimulated && (
+                    <button
+                      type="button"
+                      onClick={() => handleVerifyChain(false)}
+                      style={{ marginTop: 6, padding: "3px 8px", fontSize: "0.72rem" }}
+                    >
+                      Restore Authentic Chain & Re-Verify
+                    </button>
+                  )}
+                </div>
+              )}
+
+              {combinedLedger.length === 0 ? (
+                <div className="muted">
+                  Append-only SHA-256 receipts sync here after your first Cloud Audit or Offline Queue entry.
+                </div>
+              ) : (
+                <div style={{ display: "flex", flexDirection: "column", gap: 6, maxHeight: 260, overflowY: "auto" }}>
+                  {combinedLedger.map((item, idx) => {
+                    const isExpanded = expandedDocId === item.docId;
+                    const isPending = item.syncStatus === "PENDING_SYNC";
+                    return (
+                      <div
+                        key={item.docId || item.receiptSha256}
+                        className="wire-item"
+                        onClick={() => setExpandedDocId(isExpanded ? null : item.docId)}
+                        style={{ cursor: "pointer" }}
+                        title="Click to inspect full SHA-256 hash chain receipt"
+                      >
+                        <div className="row" style={{ justifyContent: "space-between" }}>
+                          <strong>
+                            #{combinedLedger.length - idx} {item.policyProfile} · {item.riskLevel}
+                          </strong>
+                          <div className="row" style={{ gap: 6 }}>
+                            <span
+                              className={`badge ${isPending ? "amber" : "green"}`}
+                              style={{ padding: "2px 7px", fontSize: "0.66rem" }}
+                            >
+                              {isPending ? "PENDING_SYNC" : "SYNCED"}
+                            </span>
+                            <span className="mono muted">{item.receiptSha256.slice(0, 14)}…</span>
+                          </div>
+                        </div>
+                        <div className="muted">{item.sanitizedSummary}</div>
+                        <div className="mono muted" style={{ fontSize: "0.7rem", marginTop: 2 }}>
+                          prev:{" "}
+                          {item.prevReceiptSha256
+                            ? `${item.prevReceiptSha256.slice(0, 14)}…`
+                            : "GENESIS (null)"}
+                          {" · "}
+                          {isExpanded ? "hide details ▲" : "inspect hashes ▼"}
+                        </div>
+
+                        {isExpanded && (
+                          <div
+                            className="mono"
+                            style={{
+                              marginTop: 6,
+                              paddingTop: 6,
+                              borderTop: "1px solid var(--border)",
+                              fontSize: "0.68rem",
+                              color: "#cbd5e1",
+                              wordBreak: "break-all",
+                              display: "flex",
+                              flexDirection: "column",
+                              gap: 2,
+                            }}
+                          >
+                            <div>docId: {item.docId}</div>
+                            <div>timestamp: {item.timestampIso}</div>
+                            <div>receiptSha256: {item.receiptSha256}</div>
+                            <div>prevReceiptSha256: {item.prevReceiptSha256 ?? "null"}</div>
+                            <div>rawDocSha256: {item.rawDocSha256}</div>
+                            <div>sanitizedPayloadSha256: {item.sanitizedPayloadSha256}</div>
+                            <div>
+                              firewall: {item.checksPassed}/6 ({item.inferenceSource})
+                            </div>
+                          </div>
+                        )}
+                      </div>
+                    );
+                  })}
+                </div>
+              )}
+
+              {/* PASSPHRASE-LOCKED .AIRLOCK.ENC VAULT EXPORT & RESTORE */}
+              <div style={{ borderTop: "1px solid var(--border)", paddingTop: 12 }}>
+                <div className="muted" style={{ marginBottom: 6 }}>
+                  <KeyRound size={13} style={{ verticalAlign: "middle", marginRight: 5 }} />
+                  <strong>Encrypted Local Vault (.airlock.enc)</strong> — PBKDF2 (100k) + AES-256-GCM
+                </div>
+                <div className="row" style={{ gap: 6 }}>
+                  <input
+                    type="password"
+                    value={vaultPassphrase}
+                    onChange={(e) => setVaultPassphrase(e.target.value)}
+                    placeholder="Vault passphrase (min 6 chars)..."
+                    style={{
+                      flex: 1,
+                      minWidth: 160,
+                      background: "#0b1220",
+                      color: "var(--text)",
+                      border: "1px solid var(--border)",
+                      borderRadius: 6,
+                      padding: "5px 8px",
+                      fontSize: "0.75rem",
+                    }}
+                  />
+                  <button
+                    type="button"
+                    onClick={() => void handleExportEncryptedVault()}
+                    disabled={!verifiedPayload || vaultPassphrase.trim().length < 6}
+                    style={{ padding: "5px 9px", fontSize: "0.72rem" }}
+                  >
+                    <Download size={12} /> Export .airlock.enc
+                  </button>
+                  <label
+                    style={{
+                      cursor: "pointer",
+                      fontSize: "0.72rem",
+                      padding: "5px 9px",
+                      borderRadius: 8,
+                      border: "1px solid var(--border)",
+                      background: "var(--panel-alt)",
+                      fontWeight: 600,
+                    }}
+                  >
+                    Restore .airlock.enc
+                    <input
+                      type="file"
+                      accept=".enc,.json"
+                      onChange={(e) => void handleRestoreEncryptedVault(e)}
+                      style={{ display: "none" }}
+                    />
+                  </label>
+                </div>
+
+                {vaultStatus && (
+                  <div
+                    className={vaultStatus.ok ? "alert-green" : "alert-red"}
+                    style={{ marginTop: 8, fontSize: "0.75rem" }}
+                  >
+                    {vaultStatus.message}
+                  </div>
+                )}
+
+                {restoredVault && (
+                  <div className="wire-item" style={{ marginTop: 8, gap: 6 }}>
+                    <div className="row" style={{ justifyContent: "space-between" }}>
+                      <span style={{ fontWeight: 700, fontSize: "0.74rem" }}>
+                        Restored Vault ({restoredVault.entries.length} tokens · Receipt{" "}
+                        <span className="mono">{restoredVault.receiptSha256.slice(0, 12)}…</span>)
+                      </span>
+                      <div className="row" style={{ gap: 4 }}>
+                        {(
+                          [
+                            { id: "diff", label: "ZK Diff" },
+                            { id: "rehydrated", label: "Re-Hydrated" },
+                            { id: "cloud", label: "Skeleton" },
+                          ] as const
+                        ).map((m) => (
+                          <button
+                            type="button"
+                            key={m.id}
+                            onClick={() => setRestoredViewMode(m.id)}
+                            style={{
+                              padding: "2px 7px",
+                              fontSize: "0.68rem",
+                              borderColor: restoredViewMode === m.id ? "#10b981" : undefined,
+                              color: restoredViewMode === m.id ? "#34d399" : undefined,
+                            }}
+                          >
+                            {m.label}
+                          </button>
+                        ))}
+                      </div>
+                    </div>
+                    <div className="codebox" style={{ maxHeight: 160, whiteSpace: "pre-wrap" }}>
+                      {restoredViewMode === "rehydrated" ? (
+                        rehydrateWithEntries(restoredSourceText, restoredVault.entries)
+                      ) : (
+                        <ZeroKnowledgeText
+                          sanitizedText={restoredSourceText}
+                          entries={restoredVault.entries}
+                          viewMode={restoredViewMode}
+                        />
+                      )}
+                    </div>
+                  </div>
+                )}
+              </div>
+
+              {/* ZERO-TRUST EXTERNAL PROOF JSON AUDITOR (100% OFFLINE) */}
+              <div style={{ borderTop: "1px solid var(--border)", paddingTop: 12 }}>
+                <div className="row" style={{ justifyContent: "space-between", alignItems: "center" }}>
+                  <span className="muted" style={{ fontSize: "0.76rem" }}>
+                    <FileCheck2 size={13} style={{ verticalAlign: "middle", marginRight: 5 }} />
+                    <strong>Zero-Trust External Proof Auditor</strong> (Offline — Verifies Ledger + Active Attestation)
+                  </span>
+                  <label
+                    style={{
+                      cursor: "pointer",
+                      fontSize: "0.72rem",
+                      padding: "4px 8px",
+                      borderRadius: 6,
+                      border: "1px solid var(--border)",
+                      background: "var(--panel-alt)",
+                      fontWeight: 600,
+                    }}
+                  >
+                    Verify Proof JSON File
+                    <input
+                      type="file"
+                      accept=".json,application/json"
+                      onChange={(e) => void handleAuditExternalProofFile(e)}
+                      style={{ display: "none" }}
+                    />
+                  </label>
+                </div>
+                {externalProofReport && (
+                  <div
+                    className={externalProofReport.ok ? "alert-green" : "alert-red"}
+                    style={{ marginTop: 8, fontSize: "0.75rem" }}
+                  >
+                    <div><strong>{externalProofReport.verdict}</strong></div>
+                    <div className="mono" style={{ fontSize: "0.7rem", marginTop: 3 }}>
+                      file: {externalProofReport.fileName} · project: {externalProofReport.projectId} · zeroPii:{" "}
+                      {String(externalProofReport.zeroPiiClean)}
+                    </div>
+                  </div>
+                )}
+              </div>
+            </>
+          )}
         </section>
       </div>
     </div>

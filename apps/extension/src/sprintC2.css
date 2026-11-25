@@ -1,0 +1,40 @@
+/* Sprint C2: Zero-Knowledge Diff Chips & Cross-Surface Controls for Chrome Side Panel */
+
+.sp-zk-local {
+  display: inline-flex;
+  align-items: baseline;
+  gap: 3px;
+  padding: 0 4px;
+  border-radius: 4px;
+  background: rgba(16, 185, 129, 0.2);
+  border: 1px solid rgba(16, 185, 129, 0.5);
+  color: #a7f3d0;
+  font-weight: 600;
+}
+
+.sp-zk-tag {
+  font-family: ui-monospace, SFMono-Regular, Menlo, monospace;
+  font-size: 9px;
+  color: #6ee7b7;
+}
+
+.sp-zk-cloud {
+  display: inline-block;
+  padding: 0 4px;
+  border-radius: 4px;
+  background: rgba(56, 189, 248, 0.16);
+  border: 1px solid rgba(56, 189, 248, 0.45);
+  color: #7dd3fc;
+  font-family: ui-monospace, SFMono-Regular, Menlo, monospace;
+}
+
+.sp-input {
+  flex: 1;
+  min-width: 110px;
+  background: #060a12;
+  color: #e2e8f0;
+  border: 1px solid #1e293b;
+  border-radius: 6px;
+  padding: 4px 7px;
+  font-size: 11px;
+}
