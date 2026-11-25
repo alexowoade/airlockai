@@ -21,6 +21,8 @@ import {
 } from "./firebase.js";
 import { wireTap } from "./wireTap.js";
 import { neutralizePromptInjections, type PromptInjectionReport } from "../utils/promptInjectionGuard.js";
+import { scanPolicyAsCodeSpans, type CompliancePackId, type CustomRegexRule } from "../utils/policyStudio.js";
+import { TokenBoundaryStreamFsm, type StreamFsmMetrics, type StreamingAuditSnapshot } from "../utils/streamRehydrator.js";
 import {
   analyzeResidualRisks,
   quasiHitsToSpans,
@@ -73,6 +75,7 @@ export interface CloudAuditOutput {
   readonly inferenceSource: "IN_CLOUD";
   readonly latencyMs: number;
   readonly ledgerDocId: string | null;
+  readonly streamMetrics?: StreamFsmMetrics;
 }
 
 interface NanoExtractionJson {
@@ -145,6 +148,8 @@ export async function runLocalAirlock(params: {
   prevReceiptSha256: string | null;
   customSecrets?: ReadonlyArray<string>;
   strictSafeHarbor?: boolean;
+  policyPacks?: ReadonlyArray<CompliancePackId>;
+  customRegexRules?: ReadonlyArray<CustomRegexRule>;
 }): Promise<LocalAirlockOutput> {
   const handles = getFirebaseHandles();
   const vault = new AirlockVault();
@@ -225,14 +230,19 @@ export async function runLocalAirlock(params: {
     customSpans.push(...findAllOccurrences(workingText, term, "SECRET_TERM", "GATE1_REGEX"));
   }
 
-  const allLocalSpans = [...gate1Spans, ...safeHarborSpans, ...customSpans];
+  const policyAsCodeSpans = scanPolicyAsCodeSpans(
+    workingText,
+    params.policyPacks ?? [],
+    params.customRegexRules ?? []
+  );
+  const allLocalSpans = [...gate1Spans, ...safeHarborSpans, ...policyAsCodeSpans, ...customSpans];
   const uniqueCategories = Array.from(new Set(allLocalSpans.map((s) => s.category))).join(", ");
   wireTap.record({
     stage: "GATE1_REGEX",
     inferenceSource: "DETERMINISTIC_LOCAL",
     latencyMs: Math.max(1, Math.round(performance.now() - g1Start)),
     bytesSent: 0,
-    payloadPreview: `Deterministic scanner matched ${gate1Spans.length} core + ${safeHarborSpans.length} Safe Harbor + ${customSpans.length} custom spans (${uniqueCategories || "none"}).`,
+    payloadPreview: `Deterministic scanner matched ${gate1Spans.length} core + ${safeHarborSpans.length} Safe Harbor + ${policyAsCodeSpans.length} policy-as-code + ${customSpans.length} custom spans (${uniqueCategories || "none"}).`,
   });
 
   const mergedSpans = resolveOverlappingSpans([...allLocalSpans, ...gate2Spans]);
@@ -284,7 +294,7 @@ export async function runLocalAirlock(params: {
     candidateSanitized,
     vault,
     mergedSpans,
-    gate1Count: gate1Spans.length + safeHarborSpans.length,
+    gate1Count: gate1Spans.length + safeHarborSpans.length + policyAsCodeSpans.length,
     gate2Count: gate2Spans.length,
     customCount: customSpans.length,
     gate2UsedNano,
@@ -346,6 +356,7 @@ export async function runDeepCloudAudit(params: {
   templateIdOverride?: string;
   auditMode?: "SERVER_TEMPLATE" | "STRUCTURED_JSON";
   onLedgerSynced?: (docId: string) => void;
+  onStreamUpdate?: (snapshot: StreamingAuditSnapshot) => void;
 }): Promise<CloudAuditOutput> {
   const handles = getFirebaseHandles();
   if (!handles) {
@@ -359,6 +370,7 @@ export async function runDeepCloudAudit(params: {
   let structured: StructuredAuditPayload | null = null;
   let usedServerTemplate = false;
   let effectiveMode: "SERVER_TEMPLATE" | "STRUCTURED_JSON" = requestedMode;
+  let streamMetrics: StreamFsmMetrics | undefined;
 
   if (requestedMode === "STRUCTURED_JSON") {
     const schemaPrompt =
@@ -385,24 +397,55 @@ export async function runDeepCloudAudit(params: {
     sanitizedMarkdown = formatStructuredToMarkdown(structured);
     effectiveMode = "STRUCTURED_JSON";
   } else {
+    let finalSnap: StreamingAuditSnapshot | null = null;
     try {
-      const res = await handles.templateAuditModel.generateContent({
+      const fsm = new TokenBoundaryStreamFsm(params.vault, t0);
+      const streamRes = await handles.templateAuditModel.generateContentStream({
         templateId,
         templateVariables: {
           sanitizedText: params.verified.sanitizedText,
           policyProfile: params.policyProfile,
         },
       });
-      sanitizedMarkdown = res.response.text();
+      for await (const chunk of streamRes.stream) {
+        const delta = chunk.text();
+        if (delta) {
+          params.onStreamUpdate?.(fsm.pushChunk(delta));
+        }
+      }
+      finalSnap = fsm.flush();
+      params.onStreamUpdate?.(finalSnap);
+      sanitizedMarkdown = finalSnap.sanitizedSoFar;
+      streamMetrics = finalSnap.metrics;
       usedServerTemplate = true;
     } catch {
+      const fsm = new TokenBoundaryStreamFsm(params.vault, t0);
       const fallbackPrompt =
         `You are AirlockAI's compliance auditor (${params.policyProfile}). ` +
         `Preserve all redacted tokens like [ORG_1] or [CURRENCY_1] verbatim so the client can re-hydrate locally.\n` +
         `Provide:\n1. Overall Risk Level (LOW/MEDIUM/HIGH/CRITICAL)\n2. Top 3 Risk Clauses\n3. Redline Counter-Proposals\n\n` +
         `Sanitized Document:\n${params.verified.sanitizedText}`;
-      const res = await handles.cloudAuditFallbackModel.generateContent(fallbackPrompt);
-      sanitizedMarkdown = res.response.text();
+      const streamRes = await handles.cloudAuditFallbackModel.generateContentStream(fallbackPrompt);
+      for await (const chunk of streamRes.stream) {
+        const delta = chunk.text();
+        if (delta) {
+          params.onStreamUpdate?.(fsm.pushChunk(delta));
+        }
+      }
+      finalSnap = fsm.flush();
+      params.onStreamUpdate?.(finalSnap);
+      sanitizedMarkdown = finalSnap.sanitizedSoFar;
+      streamMetrics = finalSnap.metrics;
+    }
+
+    if (streamMetrics) {
+      wireTap.record({
+        stage: "STREAM_FSM",
+        inferenceSource: "DETERMINISTIC_LOCAL",
+        latencyMs: Math.max(1, Math.round(streamMetrics.localRehydrateMs)),
+        bytesSent: 0,
+        payloadPreview: `STREAMING TOKEN-BOUNDARY FSM — TTFT ${streamMetrics.ttftMs ?? 0}ms · ${streamMetrics.chunkCount} chunks · ${streamMetrics.heldBoundarySplits} split token(s) held safely · ${streamMetrics.tokensResolved} local RAM pills resolved (${streamMetrics.localRehydrateMs}ms overhead).`,
+      });
     }
   }
 
@@ -452,5 +495,6 @@ export async function runDeepCloudAudit(params: {
     inferenceSource: "IN_CLOUD",
     latencyMs,
     ledgerDocId,
+    streamMetrics,
   };
 }

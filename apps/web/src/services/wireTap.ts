@@ -13,7 +13,8 @@ export interface WireEvent {
     | "VAULT_CRYPTO"
     | "AIR_GAP"
     | "PROMPT_INJECTION_GUARD"
-    | "ORACLE_TOOL_CALL";
+    | "ORACLE_TOOL_CALL"
+    | "STREAM_FSM";
   readonly inferenceSource: "ON_DEVICE" | "IN_CLOUD" | "DETERMINISTIC_LOCAL" | "BLOCKED";
   readonly latencyMs: number;
   readonly bytesSent: number;

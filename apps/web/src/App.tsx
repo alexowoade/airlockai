@@ -95,6 +95,9 @@ import { exportFlattenedRedactedPdf } from "./utils/flattenedPdfExport.js";
 import { exportExecutiveAuditBrief } from "./utils/auditBriefExport.js";
 import { neutralizePromptInjections, SAMPLE_INJECTION_PAYLOAD, type PromptInjectionReport } from "./utils/promptInjectionGuard.js";
 import { DEAL_ROOM_SCENARIOS } from "./data/dealRoomSamples.js";
+import { PolicyStudioPanel } from "./components/PolicyStudioPanel.js";
+import type { CompliancePackId, CustomRegexRule } from "./utils/policyStudio.js";
+import type { StreamingAuditSnapshot } from "./utils/streamRehydrator.js";
 import { runDealRoomLocalAirlock, runDealRoomOracleAudit, type DealRoomAirlockOutput, type DealRoomOracleAuditOutput } from "./services/dealRoomPipeline.js";
 import "./sprintC.css";
 
@@ -151,6 +154,11 @@ export default function App() {
   const [docBText, setDocBText] = useState(DEAL_ROOM_SCENARIOS[0]!.docBText);
   const [dealRoomOut, setDealRoomOut] = useState<DealRoomAirlockOutput | null>(null);
   const [oracleOut, setOracleOut] = useState<DealRoomOracleAuditOutput | null>(null);
+
+  // Sprint E2: Streaming Token-Boundary FSM + Live Remote Config Policy-as-Code Studio
+  const [enabledPolicyPacks, setEnabledPolicyPacks] = useState<CompliancePackId[]>([]);
+  const [customRegexRules, setCustomRegexRules] = useState<CustomRegexRule[]>([]);
+  const [streamSnap, setStreamSnap] = useState<StreamingAuditSnapshot | null>(null);
   const effectiveOnline = isOnline && !airGapSimulated;
 
   const [busy, setBusy] = useState<string | null>(null);
@@ -406,6 +414,8 @@ export default function App() {
         policy,
         prevReceiptSha256: prevHash,
         customSecrets: activeSecrets,
+        policyPacks: enabledPolicyPacks,
+        customRegexRules,
         strictSafeHarbor: activeSafeHarbor,
       });
       setAirlockOut(result);
@@ -721,7 +731,9 @@ export default function App() {
           policy,
           prevReceiptSha256: prevHash,
           customSecrets,
-          strictSafeHarbor,
+          policyPacks: enabledPolicyPacks,
+        customRegexRules,
+        strictSafeHarbor,
         });
         setAirlockOut(targetAirlock);
       }
@@ -818,12 +830,19 @@ export default function App() {
     setBusy(auditMode === "STRUCTURED_JSON" ? "cloud-json" : "cloud");
     setErrorMsg(null);
     try {
+      setStreamSnap(null);
+      if (auditMode === "SERVER_TEMPLATE") {
+        setCloudOut(null);
+      }
       const res = await runDeepCloudAudit({
         verified: airlockOut.firewallResult.payload,
         vault: airlockOut.vault,
         policyProfile: policy.profile,
         templateIdOverride: policy.templateId,
         auditMode,
+        onStreamUpdate: (snap) => {
+          setStreamSnap(snap);
+        },
         onLedgerSynced: () => {
           fetchZeroPiiAuditLedger()
             .then((updated) => {
@@ -920,6 +939,20 @@ export default function App() {
     } finally {
       setBusy(null);
     }
+  }
+
+  function handleTogglePolicyPack(packId: CompliancePackId) {
+    setEnabledPolicyPacks((prev) =>
+      prev.includes(packId) ? prev.filter((p) => p !== packId) : [...prev, packId]
+    );
+  }
+
+  function handleAddCustomRegexRule(rule: CustomRegexRule) {
+    setCustomRegexRules((prev) => [...prev, rule]);
+  }
+
+  function handleRemoveCustomRegexRule(id: string) {
+    setCustomRegexRules((prev) => prev.filter((r) => r.id !== id));
   }
 
   function handlePromptInjectionAttack() {
@@ -1185,6 +1218,15 @@ export default function App() {
               </button>
             ))}
           </div>
+
+          <PolicyStudioPanel
+            policy={policy}
+            enabledPacks={enabledPolicyPacks}
+            customRules={customRegexRules}
+            onTogglePack={handleTogglePolicyPack}
+            onAddRule={handleAddCustomRegexRule}
+            onRemoveRule={handleRemoveCustomRegexRule}
+          />
 
           {/* LOCAL FILE DROPZONE (PDF + TEXT + IMAGE, 100% ON-DEVICE) */}
           <div
@@ -1849,6 +1891,40 @@ export default function App() {
                   )}
 
                   {/* CLOUD AUDIT OUTPUT WITH ZERO-KNOWLEDGE DIFF HIGHLIGHTER & REDLINE CARDS */}
+                  {streamSnap && busy === "cloud" && airlockOut && (
+                    <div
+                      className="wire-item"
+                      style={{ gap: 8, borderColor: "rgba(56, 189, 248, 0.55)" }}
+                    >
+                      <div className="row" style={{ justifyContent: "space-between", alignItems: "center" }}>
+                        <strong>Live Streaming Token-Boundary FSM (generateContentStream)</strong>
+                        <span className="badge blue">
+                          TTFT {streamSnap.metrics.ttftMs ?? "…"}ms · {streamSnap.metrics.chunkCount} chunks ·{" "}
+                          {streamSnap.metrics.heldBoundarySplits} splits held ·{" "}
+                          {streamSnap.metrics.tokensResolved} pills · {streamSnap.metrics.localRehydrateMs}ms FSM
+                        </span>
+                      </div>
+                      <div className="codebox" style={{ maxHeight: 240, whiteSpace: "pre-wrap" }}>
+                        <ZeroKnowledgeText
+                          sanitizedText={streamSnap.sanitizedSoFar}
+                          entries={airlockOut.vault.getEntries(false)}
+                          viewMode={zkViewMode}
+                        />
+                      </div>
+                    </div>
+                  )}
+
+                  {cloudOut?.streamMetrics && (
+                    <div className="alert-green" style={{ fontSize: "0.73rem" }}>
+                      <strong>STREAMING FSM TELEMETRY:</strong> TTFT{" "}
+                      <strong>{cloudOut.streamMetrics.ttftMs ?? 0}ms</strong> ·{" "}
+                      <strong>{cloudOut.streamMetrics.chunkCount}</strong> network chunks ·{" "}
+                      <strong>{cloudOut.streamMetrics.heldBoundarySplits}</strong> mid-token boundary split(s) held safely ·{" "}
+                      <strong>{cloudOut.streamMetrics.tokensResolved}</strong> emerald pills re-hydrated locally in{" "}
+                      <strong>{cloudOut.streamMetrics.localRehydrateMs}ms</strong> (0B raw PII sent).
+                    </div>
+                  )}
+
                   {cloudOut && (
                     <div style={{ borderTop: "1px solid var(--border)", paddingTop: 12 }}>
                       <div
@@ -2088,7 +2164,7 @@ export default function App() {
                       ONLY_IN_CLOUD / Templates
                     </div>
                     <div className="muted" style={{ fontSize: "0.72rem" }}>
-                      Server Prompt Templates + JSON Schema on zero-PII tokens; re-hydrated in RAM.
+                      Stream Server Template (Live FSM)s + JSON Schema on zero-PII tokens; re-hydrated in RAM.
                     </div>
                   </div>
                 </div>
