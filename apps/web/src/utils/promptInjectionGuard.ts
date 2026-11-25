@@ -15,11 +15,11 @@ export const SAMPLE_INJECTION_PAYLOAD =
 const INJECTION_RULES: ReadonlyArray<{ rule: string; regex: RegExp }> = [
   {
     rule: "INSTRUCTION_OVERRIDE",
-    regex: /\b(?:ignore|disregard|forget)\s+(?:all\s+)?(?:previous|prior|above|system)\s+instructions?\b[^.\n]*/gi,
+    regex: /\b(?:ignore|disregard|forget)\s+(?:all\s+)?(?:previous|prior|above|system)\s+instructions?\b/gi,
   },
   {
     rule: "RISK_MANIPULATION",
-    regex: /\b(?:rate|classify|mark|report)\s+(?:this|the)\s+(?:contract|document|nda|invoice|bill)\s+(?:as\s+)?low\s+risk\b[^.\n]*/gi,
+    regex: /\b(?:rate|classify|mark|report)\s+(?:this|the)\s+(?:contract|document|nda|invoice|bill)\s+(?:as\s+)?low\s+risk\b/gi,
   },
   {
     rule: "SYSTEM_ROLE_SPOOF",
@@ -27,11 +27,11 @@ const INJECTION_RULES: ReadonlyArray<{ rule: string; regex: RegExp }> = [
   },
   {
     rule: "SECRET_EXFIL_DIRECTIVE",
-    regex: /\b(?:reveal|exfiltrate|print|output|leak|dump)\s+(?:the\s+)?(?:hidden\s+)?(?:vault\s+)?(?:canary|vault|system\s+prompt|secrets?|raw\s+pii)\b[^.\n]*/gi,
+    regex: /\b(?:reveal|exfiltrate|print|output|leak|dump)\s+(?:the\s+)?(?:hidden\s+)?(?:vault\s+)?(?:canary|vault|system\s+prompt|secrets?|raw\s+pii)\b/gi,
   },
   {
     rule: "POLICY_BYPASS",
-    regex: /\b(?:bypass|disable|override)\s+(?:all\s+)?(?:security|compliance|audit|firewall|redaction)\s+(?:rules?|checks?|policies?)\b[^.\n]*/gi,
+    regex: /\b(?:bypass|disable|override)\s+(?:all\s+)?(?:security|compliance|audit|firewall|redaction)\s+(?:rules?|checks?|policies?)\b/gi,
   },
 ];
 
