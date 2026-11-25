@@ -27,6 +27,7 @@ import {
   type TemplateGenerativeModel,
 } from "firebase/ai";
 import type { AirlockReceipt, PolicyProfile } from "@airlock/core";
+import { ZK_ORACLE_FUNCTION_DECLARATIONS } from "../utils/zkOracleTools.js";
 
 export interface AirlockPolicyConfig {
   readonly profile: PolicyProfile;
@@ -138,6 +139,7 @@ export interface FirebaseHandles {
   templateAuditModel: TemplateGenerativeModel;
   cloudAuditFallbackModel: GenerativeModel;
   structuredAuditModel: GenerativeModel;
+  zkOracleModel: GenerativeModel;
 }
 
 let cachedHandles: FirebaseHandles | null = null;
@@ -216,6 +218,15 @@ export function getFirebaseHandles(): FirebaseHandles | null {
     },
   });
 
+  // 6. Zero-Knowledge Local Oracle Model (ONLY_IN_CLOUD + Native Function Calling)
+  const zkOracleModel = getGenerativeModel(ai, {
+    model: "gemini-3.5-flash-lite",
+    tools: [{ functionDeclarations: ZK_ORACLE_FUNCTION_DECLARATIONS }],
+    generationConfig: {
+      maxOutputTokens: 1400,
+    },
+  });
+
   cachedHandles = {
     app,
     auth,
@@ -227,6 +238,7 @@ export function getFirebaseHandles(): FirebaseHandles | null {
     templateAuditModel,
     cloudAuditFallbackModel,
     structuredAuditModel,
+    zkOracleModel,
   };
   return cachedHandles;
 }

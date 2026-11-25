@@ -94,6 +94,8 @@ import {
 import { exportFlattenedRedactedPdf } from "./utils/flattenedPdfExport.js";
 import { exportExecutiveAuditBrief } from "./utils/auditBriefExport.js";
 import { neutralizePromptInjections, SAMPLE_INJECTION_PAYLOAD, type PromptInjectionReport } from "./utils/promptInjectionGuard.js";
+import { DEAL_ROOM_SCENARIOS } from "./data/dealRoomSamples.js";
+import { runDealRoomLocalAirlock, runDealRoomOracleAudit, type DealRoomAirlockOutput, type DealRoomOracleAuditOutput } from "./services/dealRoomPipeline.js";
 import "./sprintC.css";
 
 type WorkspaceTab = "audit" | "redteam" | "ledger";
@@ -140,6 +142,15 @@ export default function App() {
   const [flattenedPdfMsg, setFlattenedPdfMsg] = useState<string | null>(null);
   const [injectionTestReport, setInjectionTestReport] = useState<PromptInjectionReport | null>(null);
   const [briefExportMsg, setBriefExportMsg] = useState<string | null>(null);
+
+  // Sprint E1: Multi-Document Deal Room + Zero-Knowledge Local Oracle Function Calling
+  const [stageMode, setStageMode] = useState<"single" | "dealroom">("single");
+  const [docATitle, setDocATitle] = useState(DEAL_ROOM_SCENARIOS[0]!.docATitle);
+  const [docAText, setDocAText] = useState(DEAL_ROOM_SCENARIOS[0]!.docAText);
+  const [docBTitle, setDocBTitle] = useState(DEAL_ROOM_SCENARIOS[0]!.docBTitle);
+  const [docBText, setDocBText] = useState(DEAL_ROOM_SCENARIOS[0]!.docBText);
+  const [dealRoomOut, setDealRoomOut] = useState<DealRoomAirlockOutput | null>(null);
+  const [oracleOut, setOracleOut] = useState<DealRoomOracleAuditOutput | null>(null);
   const effectiveOnline = isOnline && !airGapSimulated;
 
   const [busy, setBusy] = useState<string | null>(null);
@@ -858,6 +869,59 @@ export default function App() {
     });
   }
 
+  async function handleRunDealRoomAirlock() {
+    setBusy("dealroom-airlock");
+    setErrorMsg(null);
+    setOracleOut(null);
+    try {
+      const prevHash = combinedLedger[0]?.receiptSha256 ?? null;
+      const out = await runDealRoomLocalAirlock({
+        docATitle,
+        docAText,
+        docBTitle,
+        docBText,
+        policyProfile: policy.profile,
+        prevReceiptSha256: prevHash,
+      });
+      setDealRoomOut(out);
+      setActiveTab("audit");
+    } catch (err) {
+      setErrorMsg(err instanceof Error ? err.message : "Deal Room shared-vault airlock failed.");
+    } finally {
+      setBusy(null);
+    }
+  }
+
+  async function handleRunZkOracleAudit() {
+    if (!dealRoomOut || !dealRoomOut.firewallResult.ok) return;
+    setBusy("dealroom-oracle");
+    setErrorMsg(null);
+    try {
+      const res = await runDealRoomOracleAudit({
+        verified: dealRoomOut.firewallResult.payload,
+        vault: dealRoomOut.vault,
+        policyProfile: policy.profile,
+        onLedgerSynced: () => {
+          fetchZeroPiiAuditLedger()
+            .then((updated) => {
+              if (updated.length > 0) {
+                setLedger(updated);
+                setChainReport(null);
+                setIsTamperSimulated(false);
+              }
+            })
+            .catch(() => {});
+        },
+      });
+      setOracleOut(res);
+      setZkViewMode("diff");
+    } catch (err) {
+      setErrorMsg(err instanceof Error ? err.message : "Zero-Knowledge Oracle Audit failed.");
+    } finally {
+      setBusy(null);
+    }
+  }
+
   function handlePromptInjectionAttack() {
     const t0 = performance.now();
     const baseText = verifiedPayload?.sanitizedText ?? rawText;
@@ -999,6 +1063,87 @@ export default function App() {
             <span>1. Local Document Stage (Never Leaves Device)</span>
             <span className="badge blue">{policy.profile}</span>
           </h2>
+          <div className="row" style={{ gap: 6 }}>
+            <button
+              type="button"
+              onClick={() => setStageMode("single")}
+              style={{
+                padding: "4px 10px",
+                fontSize: "0.74rem",
+                borderColor: stageMode === "single" ? "#10b981" : undefined,
+                color: stageMode === "single" ? "#34d399" : undefined,
+              }}
+            >
+              Single Document / PDF
+            </button>
+            <button
+              type="button"
+              onClick={() => {
+                setStageMode("dealroom");
+                handleSelectPolicy("INVOICE_FINANCE");
+              }}
+              style={{
+                padding: "4px 10px",
+                fontSize: "0.74rem",
+                borderColor: stageMode === "dealroom" ? "#10b981" : undefined,
+                color: stageMode === "dealroom" ? "#34d399" : undefined,
+              }}
+            >
+              <Layers size={13} /> Multi-Doc Deal Room (ZK Oracle)
+            </button>
+          </div>
+
+          {stageMode === "dealroom" && (
+            <div style={{ display: "flex", flexDirection: "column", gap: 8 }}>
+              <div className="muted" style={{ fontSize: "0.75rem" }}>
+                <strong>Shared-Vault Deal Room:</strong> Both documents redact through ONE local vault so identical entities share tokens, while cloud Gemini queries local RAM oracles for exact math & IBAN checks (0B raw secrets sent).
+              </div>
+              <div className="row" style={{ gap: 6 }}>
+                <button
+                  type="button"
+                  onClick={() => {
+                    const sc = DEAL_ROOM_SCENARIOS[0]!;
+                    setDocATitle(sc.docATitle);
+                    setDocAText(sc.docAText);
+                    setDocBTitle(sc.docBTitle);
+                    setDocBText(sc.docBText);
+                    handleSelectPolicy(sc.policy);
+                    setDealRoomOut(null);
+                    setOracleOut(null);
+                  }}
+                >
+                  Load MSA + Fraudulent Wire Invoice
+                </button>
+              </div>
+              <label className="muted" style={{ fontSize: "0.74rem", fontWeight: 700 }}>
+                {docATitle}
+              </label>
+              <textarea
+                value={docAText}
+                onChange={(e) => setDocAText(e.target.value)}
+                style={{ minHeight: 110 }}
+              />
+              <label className="muted" style={{ fontSize: "0.74rem", fontWeight: 700 }}>
+                {docBTitle}
+              </label>
+              <textarea
+                value={docBText}
+                onChange={(e) => setDocBText(e.target.value)}
+                style={{ minHeight: 110 }}
+              />
+              <button
+                type="button"
+                className="primary"
+                disabled={busy !== null || !docAText.trim() || !docBText.trim()}
+                onClick={() => void handleRunDealRoomAirlock()}
+              >
+                <ShieldCheck size={16} />
+                {busy === "dealroom-airlock"
+                  ? "Running Shared-Vault Deal Room Airlock..."
+                  : "Run Shared-Vault Deal Room Airlock (0B Sent)"}
+              </button>
+            </div>
+          )}
 
           <div className="row">
             {SAMPLE_DOCS.map((sample) => (
@@ -1250,6 +1395,165 @@ export default function App() {
           {/* ================= TAB 1: AUDIT STUDIO & STRUCTURED REDLINES ================= */}
           {activeTab === "audit" && (
             <>
+              {stageMode === "dealroom" && (
+                <div className="wire-item" style={{ gap: 10, borderColor: "rgba(16, 185, 129, 0.45)" }}>
+                  <div className="row" style={{ justifyContent: "space-between", alignItems: "center" }}>
+                    <strong>
+                      Multi-Doc Deal Room & Zero-Knowledge Local Oracle (Function Calling)
+                    </strong>
+                    {dealRoomOut?.firewallResult.ok && (
+                      <span className="badge green">6/6 Shared Vault Verified</span>
+                    )}
+                  </div>
+
+                  {!dealRoomOut ? (
+                    <div className="muted" style={{ fontSize: "0.78rem" }}>
+                      Click <strong>Run Shared-Vault Deal Room Airlock</strong> on the left to bind Doc A + Doc B into one zero-knowledge vault, then invoke Cloud Gemini with local RAM Oracle tools.
+                    </div>
+                  ) : (
+                    <>
+                      {dealRoomOut.firewallResult.ok ? (
+                        <div className="alert-green" style={{ fontSize: "0.76rem" }}>
+                          <strong>Shared-Vault SHA-256 Attestation:</strong>{" "}
+                          <span className="mono">
+                            {dealRoomOut.firewallResult.payload.receipt.receiptSha256.slice(0, 22)}…
+                          </span>{" "}
+                          · <strong>{dealRoomOut.entityMatrix.length}</strong> tokens (
+                          <strong>
+                            {dealRoomOut.entityMatrix.filter((r) => r.inDocA && r.inDocB).length}
+                          </strong>{" "}
+                          co-referenced across Doc A & Doc B · 0B raw PII sent)
+                        </div>
+                      ) : (
+                        <div className="alert-red" style={{ fontSize: "0.76rem" }}>
+                          <strong>DEAL ROOM GATE 3 BLOCKED:</strong>{" "}
+                          {dealRoomOut.firewallResult.violations[0]?.vector} —{" "}
+                          {dealRoomOut.firewallResult.violations[0]?.detail}
+                        </div>
+                      )}
+
+                      {/* Cross-Document Entity Co-Reference Matrix */}
+                      <div>
+                        <div className="muted" style={{ fontSize: "0.73rem", marginBottom: 4 }}>
+                          <strong>Cross-Document Entity Co-Reference Matrix</strong> (What Cloud Sees):
+                        </div>
+                        <div style={{ display: "flex", flexWrap: "wrap", gap: 5 }}>
+                          {dealRoomOut.entityMatrix.map((row) => (
+                            <span
+                              key={row.token}
+                              className={row.inDocA && row.inDocB ? "zk-chip zk-chip-local" : "zk-chip zk-chip-cloud"}
+                              style={{ fontSize: "0.7rem" }}
+                              title={
+                                row.inDocA && row.inDocB
+                                  ? "Co-referenced across BOTH Doc A and Doc B"
+                                  : row.inDocA
+                                    ? "Doc A only"
+                                    : "Doc B only"
+                              }
+                            >
+                              {row.token}
+                              <span className="zk-chip-tag">
+                                {row.inDocA && row.inDocB ? "A+B" : row.inDocA ? "A" : "B"}
+                              </span>
+                            </span>
+                          ))}
+                        </div>
+                      </div>
+
+                      <div className="codebox" style={{ maxHeight: 150, whiteSpace: "pre-wrap" }}>
+                        <ZeroKnowledgeText
+                          sanitizedText={dealRoomOut.combinedSanitized}
+                          entries={dealRoomOut.vault.getEntries(false)}
+                          viewMode="cloud"
+                        />
+                      </div>
+
+                      <div className="row">
+                        <button
+                          type="button"
+                          className="cloud"
+                          disabled={
+                            busy !== null ||
+                            !dealRoomOut.firewallResult.ok ||
+                            !effectiveOnline ||
+                            !isFirebaseConfigured
+                          }
+                          onClick={() => void handleRunZkOracleAudit()}
+                        >
+                          <Zap size={14} />
+                          {busy === "dealroom-oracle"
+                            ? "Running Local Oracle Tool Loop..."
+                            : "Run Zero-Knowledge Oracle Audit (Function Calling)"}
+                        </button>
+                      </div>
+
+                      {oracleOut && (
+                        <div style={{ display: "flex", flexDirection: "column", gap: 8, borderTop: "1px solid var(--border)", paddingTop: 10 }}>
+                          <div className="alert-green" style={{ fontSize: "0.75rem" }}>
+                            <strong>
+                              ZERO-KNOWLEDGE ORACLE LOOP COMPLETE: {oracleOut.oracleTraces.length} Local RAM Tool Call(s)
+                            </strong>{" "}
+                            across {oracleOut.toolRounds} round(s) · {oracleOut.latencyMs} ms ·{" "}
+                            <strong>0B Raw Numbers / Dates / IBANs Sent</strong>
+                          </div>
+
+                          {/* Oracle Call Trace Cards */}
+                          {oracleOut.oracleTraces.map((tr, i) => (
+                            <div key={i} className="wire-item" style={{ fontSize: "0.72rem", padding: "6px 9px" }}>
+                              <div className="row" style={{ justifyContent: "space-between" }}>
+                                <span className="mono" style={{ fontWeight: 700, color: "#38bdf8" }}>
+                                  #{i + 1} {tr.toolName}({JSON.stringify(tr.args)})
+                                </span>
+                                <span className="badge green" style={{ fontSize: "0.64rem" }}>
+                                  LOCAL RAM · {tr.latencyMs}ms · 0B PII
+                                </span>
+                              </div>
+                              <div className="mono muted" style={{ marginTop: 3, wordBreak: "break-word" }}>
+                                Predicate returned → {JSON.stringify(tr.predicateResult)}
+                              </div>
+                            </div>
+                          ))}
+
+                          <div className="row" style={{ justifyContent: "space-between", alignItems: "center" }}>
+                            <strong>Cross-Contract Fraud Verdict</strong>
+                            <div className="row" style={{ gap: 4 }}>
+                              {(
+                                [
+                                  { id: "diff", label: "Zero-Knowledge Diff" },
+                                  { id: "rehydrated", label: "Clean Re-Hydrated" },
+                                  { id: "cloud", label: "What Cloud Saw" },
+                                ] as const
+                              ).map((m) => (
+                                <button
+                                  type="button"
+                                  key={m.id}
+                                  onClick={() => setZkViewMode(m.id)}
+                                  style={{
+                                    padding: "3px 7px",
+                                    fontSize: "0.7rem",
+                                    borderColor: zkViewMode === m.id ? "#10b981" : undefined,
+                                    color: zkViewMode === m.id ? "#34d399" : undefined,
+                                  }}
+                                >
+                                  {m.label}
+                                </button>
+                              ))}
+                            </div>
+                          </div>
+
+                          <div className="codebox" style={{ maxHeight: 280, whiteSpace: "pre-wrap" }}>
+                            <ZeroKnowledgeText
+                              sanitizedText={oracleOut.sanitizedVerdictMarkdown}
+                              entries={dealRoomOut.vault.getEntries(false)}
+                              viewMode={zkViewMode}
+                            />
+                          </div>
+                        </div>
+                      )}
+                    </>
+                  )}
+                </div>
+              )}
               <h2>
                 <span>Verified Airlock & Hybrid Inference</span>
                 {verifiedPayload && (

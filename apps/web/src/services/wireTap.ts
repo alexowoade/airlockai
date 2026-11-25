@@ -12,7 +12,8 @@ export interface WireEvent {
     | "OFFLINE_QUEUE"
     | "VAULT_CRYPTO"
     | "AIR_GAP"
-    | "PROMPT_INJECTION_GUARD";
+    | "PROMPT_INJECTION_GUARD"
+    | "ORACLE_TOOL_CALL";
   readonly inferenceSource: "ON_DEVICE" | "IN_CLOUD" | "DETERMINISTIC_LOCAL" | "BLOCKED";
   readonly latencyMs: number;
   readonly bytesSent: number;
