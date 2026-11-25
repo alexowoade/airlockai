@@ -1,4 +1,4 @@
-import { sha256Hex, type VerifiedSanitizedPayload } from "@airlock/core";
+import { sha256Hex, type AirlockReceipt, type VerifiedSanitizedPayload } from "@airlock/core";
 import type { LedgerRecord } from "../services/firebase.js";
 
 export interface ChainVerificationReport {
@@ -12,9 +12,20 @@ export interface ChainVerificationReport {
   readonly detail: string;
 }
 
+export interface ExternalProofAuditReport {
+  readonly ok: boolean;
+  readonly fileName: string;
+  readonly projectId: string;
+  readonly exportedAtIso: string;
+  readonly zeroPiiClean: boolean;
+  readonly piiFindings: ReadonlyArray<string>;
+  readonly chainReport: ChainVerificationReport;
+  readonly verdict: string;
+}
+
 /**
  * Cryptographically recomputes every receiptSha256 and verifies prevReceiptSha256 linkage
- * across the Firestore audit ledger (walks oldest -> newest).
+ * across the audit ledger (walks oldest -> newest).
  */
 export async function verifyLedgerChain(
   recordsNewestFirst: ReadonlyArray<LedgerRecord>
@@ -29,7 +40,7 @@ export async function verifyLedgerChain(
       brokenLinkNumber: null,
       expectedHash: null,
       actualHash: null,
-      detail: "No audit receipts in ledger yet. Run a Deep Cloud Audit to mint Genesis Link #1.",
+      detail: "No audit receipts in ledger yet. Run a Deep Cloud Audit or Queue Offline Receipt to mint Link #1.",
     };
   }
 
@@ -114,6 +125,133 @@ export function simulateOneByteTamper(
     rawDocSha256: `${flippedChar}${head.rawDocSha256.slice(1)}`,
   };
   return [tamperedHead, ...recordsNewestFirst.slice(1)];
+}
+
+/**
+ * Independent, 100% offline auditor for any exported AirlockAI.ZeroPiiComplianceProof JSON file.
+ * Verifies schema, zero raw PII leakage, every SHA-256 receipt preimage, and prevReceiptSha256 linkage.
+ */
+export async function verifyExternalProofJson(
+  fileName: string,
+  rawJsonText: string
+): Promise<ExternalProofAuditReport> {
+  const emptyChain: ChainVerificationReport = {
+    ok: false,
+    totalLinks: 0,
+    verifiedHashes: 0,
+    verifiedLinks: 0,
+    brokenLinkNumber: null,
+    expectedHash: null,
+    actualHash: null,
+    detail: "No valid ledgerHistory found in certificate.",
+  };
+
+  let parsed: Record<string, unknown>;
+  try {
+    parsed = JSON.parse(rawJsonText) as Record<string, unknown>;
+  } catch {
+    return {
+      ok: false,
+      fileName,
+      projectId: "unknown",
+      exportedAtIso: "unknown",
+      zeroPiiClean: false,
+      piiFindings: ["File is not valid JSON."],
+      chainReport: emptyChain,
+      verdict: "EXTERNAL PROOF REJECTED — Invalid JSON certificate.",
+    };
+  }
+
+  const certType = String(parsed.certificateType ?? "");
+  const proto = String(parsed.protocolVersion ?? "");
+  const projectId = String(parsed.firebaseProjectId ?? "unknown");
+  const exportedAtIso = String(parsed.exportedAtIso ?? "unknown");
+
+  if (certType !== "AirlockAI.ZeroPiiComplianceProof" || proto !== "airlock.v1") {
+    return {
+      ok: false,
+      fileName,
+      projectId,
+      exportedAtIso,
+      zeroPiiClean: false,
+      piiFindings: [`Unexpected certificateType (${certType || "missing"}) or protocolVersion (${proto || "missing"}).`],
+      chainReport: emptyChain,
+      verdict: "EXTERNAL PROOF REJECTED — Unrecognized certificate schema.",
+    };
+  }
+
+  // Zero-PII scan over the entire exported JSON certificate
+  const piiFindings: string[] = [];
+  if (/[A-Za-z0-9._%+-]+@[A-Za-z0-9.-]+\.[A-Za-z]{2,}/.test(rawJsonText)) {
+    piiFindings.push("Raw email pattern detected in certificate JSON.");
+  }
+  if (/\b\d{3}-\d{2}-\d{4}\b/.test(rawJsonText)) {
+    piiFindings.push("Raw SSN pattern detected in certificate JSON.");
+  }
+  if (/\b(?:\d{4}[- ]?){3}\d{4}\b/.test(rawJsonText)) {
+    piiFindings.push("Raw 16-digit card pattern detected in certificate JSON.");
+  }
+  if (/\b(?:sk-live-|AIza[0-9A-Za-z_-]{10,}|ghp_[0-9A-Za-z]{10,})/.test(rawJsonText)) {
+    piiFindings.push("Raw API secret prefix detected in certificate JSON.");
+  }
+
+  let attestationChecked = false;
+  let attestationError: string | null = null;
+  if (parsed.activeSessionAttestation !== null && parsed.activeSessionAttestation !== undefined) {
+    if (typeof parsed.activeSessionAttestation !== "object") {
+      attestationError = "activeSessionAttestation is malformed.";
+    } else {
+      const att = parsed.activeSessionAttestation as { receipt?: Partial<AirlockReceipt> };
+      const rec = att.receipt;
+      if (!rec || typeof rec !== "object" || typeof rec.receiptSha256 !== "string") {
+        attestationError = "activeSessionAttestation.receipt is missing or malformed.";
+      } else if (rec.firewallPassed !== true || rec.checksPassed !== 6) {
+        attestationError = "activeSessionAttestation.receipt failed 6/6 firewall assertion.";
+      } else {
+        const preimage = JSON.stringify({
+          receiptVersion: rec.receiptVersion,
+          rawDocSha256: rec.rawDocSha256,
+          sanitizedPayloadSha256: rec.sanitizedPayloadSha256,
+          prevReceiptSha256: rec.prevReceiptSha256 ?? null,
+          redactedCount: rec.redactedCount,
+          policyProfile: rec.policyProfile,
+          timestampIso: rec.timestampIso,
+        });
+        const recomputed = await sha256Hex(preimage);
+        if (recomputed !== rec.receiptSha256) {
+          attestationError = `ACTIVE SESSION ATTESTATION TAMPERED: Recomputed SHA-256 (${recomputed.slice(0, 14)}…) does not match stored receipt (${rec.receiptSha256.slice(0, 14)}…).`;
+        } else {
+          attestationChecked = true;
+        }
+      }
+    }
+  }
+
+  const rawHistory = Array.isArray(parsed.ledgerHistory) ? (parsed.ledgerHistory as LedgerRecord[]) : [];
+  const chainReport = await verifyLedgerChain(rawHistory);
+  const zeroPiiClean = piiFindings.length === 0 && parsed.containsRawPii === false;
+  const ok = zeroPiiClean && attestationError === null && chainReport.ok && rawHistory.length > 0;
+
+  const verdict = ok
+    ? `EXTERNAL PROOF VERIFIED OFFLINE — ${chainReport.verifiedHashes}/${chainReport.totalLinks} SHA-256 receipts & ${chainReport.verifiedLinks}/${Math.max(0, chainReport.totalLinks - 1)} chain links${attestationChecked ? " + active session attestation" : ""} intact · Zero raw PII detected.`
+    : !zeroPiiClean
+      ? `EXTERNAL PROOF REJECTED — Raw PII violation (${piiFindings.join(" ")})`
+      : attestationError !== null
+        ? `EXTERNAL PROOF REJECTED — ${attestationError}`
+        : rawHistory.length === 0
+          ? "EXTERNAL PROOF INCOMPLETE — Certificate contains 0 ledger receipts."
+          : `EXTERNAL PROOF REJECTED — ${chainReport.detail}`;
+
+  return {
+    ok,
+    fileName,
+    projectId,
+    exportedAtIso,
+    zeroPiiClean,
+    piiFindings,
+    chainReport,
+    verdict,
+  };
 }
 
 /**

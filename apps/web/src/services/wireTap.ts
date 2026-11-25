@@ -5,10 +5,12 @@ export interface WireEvent {
     | "GATE1_REGEX"
     | "GATE2_NANO_ON_DEVICE"
     | "GATE3_FIREWALL_BLOCK"
-  | "GATE3_FIREWALL_PASS"
+    | "GATE3_FIREWALL_PASS"
     | "OFFLINE_TRIAGE"
     | "CLOUD_TEMPLATE_AUDIT"
-    | "HTTP_WIRE_OUTBOUND";
+    | "HTTP_WIRE_OUTBOUND"
+    | "OFFLINE_QUEUE"
+    | "VAULT_CRYPTO";
   readonly inferenceSource: "ON_DEVICE" | "IN_CLOUD" | "DETERMINISTIC_LOCAL" | "BLOCKED";
   readonly latencyMs: number;
   readonly bytesSent: number;

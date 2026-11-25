@@ -6,13 +6,17 @@ import {
   Download,
   Eye,
   EyeOff,
+  FileCheck2,
   FileImage,
   FileText,
+  KeyRound,
   Lock,
   Plus,
+  RefreshCw,
   ShieldAlert,
   ShieldCheck,
   Upload,
+  WifiOff,
   Zap,
 } from "lucide-react";
 import {
@@ -57,8 +61,10 @@ import {
   simulateOneByteTamper,
   triggerDataUrlDownload,
   triggerLocalDownload,
+  verifyExternalProofJson,
   verifyLedgerChain,
   type ChainVerificationReport,
+  type ExternalProofAuditReport,
 } from "./utils/chainVerifier.js";
 import {
   generateSyntheticMultiPageNdaPdfBytes,
@@ -66,6 +72,18 @@ import {
   renderRedactedPdfPages,
   type ParsedPdfDocument,
 } from "./utils/pdfRedactor.js";
+import {
+  enqueueOfflineReceipt,
+  flushPendingQueueToFirestore,
+  loadPendingQueue,
+  type PendingLedgerRecord,
+} from "./utils/offlineQueue.js";
+import {
+  decryptVaultFromFileJson,
+  encryptVaultToFileJson,
+  rehydrateWithEntries,
+  type DecryptedVaultBundle,
+} from "./utils/encryptedVaultFile.js";
 
 const MAX_LOCAL_FILE_BYTES = 5_242_880; // 5 MB local browser cap for PDFs/images/text
 const TEXT_EXTENSIONS = [".txt", ".md", ".csv", ".json"];
@@ -112,9 +130,63 @@ export default function App() {
 
   const [wireEvents, setWireEvents] = useState<ReadonlyArray<WireEvent>>([]);
   const [ledger, setLedger] = useState<ReadonlyArray<LedgerRecord>>([]);
+  const [pendingQueue, setPendingQueue] = useState<ReadonlyArray<PendingLedgerRecord>>(() =>
+    loadPendingQueue()
+  );
+  const [queueStatusMsg, setQueueStatusMsg] = useState<string | null>(null);
+
   const [expandedDocId, setExpandedDocId] = useState<string | null>(null);
   const [chainReport, setChainReport] = useState<ChainVerificationReport | null>(null);
   const [isTamperSimulated, setIsTamperSimulated] = useState(false);
+
+  // Sprint B: Passphrase-Locked .airlock.enc Vault & External Proof Auditor
+  const [vaultPassphrase, setVaultPassphrase] = useState("");
+  const [vaultStatus, setVaultStatus] = useState<{ ok: boolean; message: string } | null>(null);
+  const [restoredVault, setRestoredVault] = useState<DecryptedVaultBundle | null>(null);
+  const [showRestoredRehydrated, setShowRestoredRehydrated] = useState(true);
+  const [externalProofReport, setExternalProofReport] = useState<ExternalProofAuditReport | null>(
+    null
+  );
+
+  // Combined ledger view (newest pending receipts chained above synced Firestore receipts)
+  const combinedLedger: ReadonlyArray<LedgerRecord & { readonly syncStatus?: "PENDING_SYNC" }> = [
+    ...pendingQueue,
+    ...ledger.filter(
+      (synced) => !pendingQueue.some((p) => p.receiptSha256 === synced.receiptSha256)
+    ),
+  ];
+
+  async function runQueueFlush(triggerReason: "auto-reconnect" | "manual") {
+    const queued = loadPendingQueue();
+    if (queued.length === 0) return;
+    setBusy("queue-flush");
+    setErrorMsg(null);
+    const t0 = performance.now();
+    try {
+      const result = await flushPendingQueueToFirestore();
+      setPendingQueue(result.remaining);
+      if (result.flushedCount > 0) {
+        const updated = await fetchZeroPiiAuditLedger().catch(() => []);
+        if (updated.length > 0) setLedger(updated);
+        setChainReport(null);
+        setIsTamperSimulated(false);
+        const msg = `Synced ${result.flushedCount} offline receipt(s) to Cloud Firestore (${triggerReason}).`;
+        setQueueStatusMsg(msg);
+        wireTap.record({
+          stage: "OFFLINE_QUEUE",
+          inferenceSource: "IN_CLOUD",
+          latencyMs: Math.max(1, Math.round(performance.now() - t0)),
+          bytesSent: result.flushedCount * 340,
+          payloadPreview: `${msg} Remaining queued: ${result.remaining.length}. Zero raw PII synced.`,
+        });
+      }
+      if (result.errorMessage) {
+        setQueueStatusMsg(result.errorMessage);
+      }
+    } finally {
+      setBusy(null);
+    }
+  }
 
   useEffect(() => {
     const unsub = wireTap.subscribe(setWireEvents);
@@ -124,7 +196,10 @@ export default function App() {
       .then(setLedger)
       .catch(() => {});
 
-    const onOnline = () => setIsOnline(true);
+    const onOnline = () => {
+      setIsOnline(true);
+      void runQueueFlush("auto-reconnect");
+    };
     const onOffline = () => setIsOnline(false);
     window.addEventListener("online", onOnline);
     window.addEventListener("offline", onOffline);
@@ -278,7 +353,7 @@ export default function App() {
     const activeSafeHarbor = overrideSafeHarbor ?? strictSafeHarbor;
 
     try {
-      const prevHash = ledger[0]?.receiptSha256 ?? null;
+      const prevHash = combinedLedger[0]?.receiptSha256 ?? null;
       const result = await runLocalAirlock({
         rawText,
         imageBase64: imageInput
@@ -305,6 +380,116 @@ export default function App() {
     } finally {
       setBusy(null);
     }
+  }
+
+  function handleQueueOfflineReceipt() {
+    if (!airlockOut || !airlockOut.firewallResult.ok) return;
+    const receipt = airlockOut.firewallResult.payload.receipt;
+    const { added, queue } = enqueueOfflineReceipt({
+      ...receipt,
+      inferenceSource: "ON_DEVICE",
+      riskLevel: airlockOut.residualRisk.riskLevel,
+      sanitizedSummary: `Offline local audit (${receipt.policyProfile}): ${receipt.redactedCount} entities redacted, 6/6 firewall vectors passed.`,
+    });
+    setPendingQueue(queue);
+    setChainReport(null);
+    setIsTamperSimulated(false);
+    const msg = added
+      ? `Queued receipt ${receipt.receiptSha256.slice(0, 14)}… locally (PENDING_SYNC · 0B sent).`
+      : "This attestation receipt is already in the offline sync queue.";
+    setQueueStatusMsg(msg);
+    wireTap.record({
+      stage: "OFFLINE_QUEUE",
+      inferenceSource: "ON_DEVICE",
+      latencyMs: 1,
+      bytesSent: 0,
+      payloadPreview: msg,
+    });
+  }
+
+  async function handleExportEncryptedVault() {
+    if (!airlockOut || !airlockOut.firewallResult.ok) return;
+    setVaultStatus(null);
+    const t0 = performance.now();
+    try {
+      const { json, envelope } = await encryptVaultToFileJson({
+        passphrase: vaultPassphrase,
+        policyProfile: policy.profile,
+        receiptSha256: airlockOut.firewallResult.payload.receipt.receiptSha256,
+        entries: airlockOut.vault.getEntries(false),
+        sanitizedText: airlockOut.firewallResult.payload.sanitizedText,
+        sanitizedAuditMarkdown: cloudOut?.sanitizedMarkdown ?? null,
+      });
+      const stamp = new Date().toISOString().slice(0, 10);
+      triggerLocalDownload(`airlock-vault-${stamp}.airlock.enc`, json, "application/json");
+      const latencyMs = Math.max(1, Math.round(performance.now() - t0));
+      const msg = `Encrypted ${envelope.entryCount} vault tokens locally via PBKDF2 (100k) + AES-256-GCM (${latencyMs} ms · 0B sent).`;
+      setVaultStatus({ ok: true, message: msg });
+      wireTap.record({
+        stage: "VAULT_CRYPTO",
+        inferenceSource: "DETERMINISTIC_LOCAL",
+        latencyMs,
+        bytesSent: 0,
+        payloadPreview: `EXPORT .airlock.enc — ${msg}`,
+      });
+    } catch (err) {
+      setVaultStatus({
+        ok: false,
+        message: err instanceof Error ? err.message : "Failed to encrypt local vault.",
+      });
+    }
+  }
+
+  async function handleRestoreEncryptedVault(e: ChangeEvent<HTMLInputElement>) {
+    const file = e.target.files?.[0];
+    e.target.value = "";
+    if (!file) return;
+    setVaultStatus(null);
+    const t0 = performance.now();
+    try {
+      const text = await file.text();
+      const bundle = await decryptVaultFromFileJson(text, vaultPassphrase);
+      setRestoredVault(bundle);
+      setShowRestoredRehydrated(true);
+      const latencyMs = Math.max(1, Math.round(performance.now() - t0));
+      const msg = `VAULT RESTORED LOCALLY — ${bundle.entries.length} tokens unlocked from ${file.name} (${latencyMs} ms · 0B sent).`;
+      setVaultStatus({ ok: true, message: msg });
+      wireTap.record({
+        stage: "VAULT_CRYPTO",
+        inferenceSource: "DETERMINISTIC_LOCAL",
+        latencyMs,
+        bytesSent: 0,
+        payloadPreview: `RESTORE .airlock.enc — ${msg}`,
+      });
+    } catch (err) {
+      const msg = err instanceof Error ? err.message : "Failed to decrypt .airlock.enc vault.";
+      setRestoredVault(null);
+      setVaultStatus({ ok: false, message: msg });
+      wireTap.record({
+        stage: "VAULT_CRYPTO",
+        inferenceSource: "BLOCKED",
+        latencyMs: Math.max(1, Math.round(performance.now() - t0)),
+        bytesSent: 0,
+        payloadPreview: msg,
+      });
+    }
+  }
+
+  async function handleAuditExternalProofFile(e: ChangeEvent<HTMLInputElement>) {
+    const file = e.target.files?.[0];
+    e.target.value = "";
+    if (!file) return;
+    const t0 = performance.now();
+    const raw = await file.text();
+    const report = await verifyExternalProofJson(file.name, raw);
+    setExternalProofReport(report);
+    wireTap.record({
+      stage: "VAULT_CRYPTO",
+      inferenceSource: report.ok ? "DETERMINISTIC_LOCAL" : "BLOCKED",
+      latencyMs: Math.max(1, Math.round(performance.now() - t0)),
+      bytesSent: 0,
+      payloadPreview: `EXTERNAL PROOF AUDIT (${file.name}) -> ${report.verdict}`,
+    });
   }
 
   async function handleAddCustomSecret(term: string) {
@@ -391,7 +576,7 @@ export default function App() {
 
   async function handleVerifyChain(simulateTamper = false) {
     setErrorMsg(null);
-    const targetRecords = simulateTamper ? simulateOneByteTamper(ledger) : ledger;
+    const targetRecords = simulateTamper ? simulateOneByteTamper(combinedLedger) : combinedLedger;
     const report = await verifyLedgerChain(targetRecords);
     setIsTamperSimulated(simulateTamper);
     setChainReport(report);
@@ -401,7 +586,7 @@ export default function App() {
     const json = buildComplianceProofJson({
       projectId: activeProjectId,
       verifiedPayload,
-      ledger,
+      ledger: combinedLedger,
       verification: chainReport,
     });
     const stamp = new Date().toISOString().replace(/[:.]/g, "-");
@@ -479,6 +664,21 @@ export default function App() {
   );
   const currentPdfPage = pdfDoc?.pages[pdfPageIdx] ?? null;
 
+  // Live Hybrid Telemetry metrics
+  const rawDocBytes = new TextEncoder().encode(rawText).byteLength;
+  const totalCloudBytesSent = wireEvents
+    .filter((ev) => ev.stage === "HTTP_WIRE_OUTBOUND")
+    .reduce((acc, ev) => acc + ev.bytesSent, 0);
+  const localEventsCount = wireEvents.filter((ev) => ev.bytesSent === 0).length;
+  const localSharePct =
+    wireEvents.length === 0 ? 100 : Math.round((localEventsCount / wireEvents.length) * 100);
+  const lastLocalMs = wireEvents.find((ev) => ev.stage === "GATE1_REGEX")?.latencyMs ?? null;
+  const lastCloudMs =
+    wireEvents.find((ev) => ev.stage === "CLOUD_TEMPLATE_AUDIT")?.latencyMs ?? null;
+
+  const restoredSourceText =
+    restoredVault?.sanitizedAuditMarkdown ?? restoredVault?.sanitizedText ?? "";
+
   return (
     <div className="shell">
       <header className="topbar">
@@ -511,6 +711,34 @@ export default function App() {
           )}
         </div>
       </header>
+
+      {/* LIVE HYBRID TELEMETRY STRIP */}
+      <div
+        className="wire-item"
+        style={{
+          marginBottom: 14,
+          flexDirection: "row",
+          flexWrap: "wrap",
+          justifyContent: "space-between",
+          alignItems: "center",
+          gap: 10,
+          padding: "8px 12px",
+        }}
+      >
+        <span className="mono" style={{ fontSize: "0.74rem" }}>
+          <strong>HYBRID TELEMETRY:</strong>{" "}
+          <span style={{ color: "#34d399" }}>Raw PII Sent: 0B</span> · Staged Local:{" "}
+          {rawDocBytes}B · Outbound Skeletons: {totalCloudBytesSent}B · Local Ops:{" "}
+          <strong>{localSharePct}%</strong>
+        </span>
+        <span className="mono muted" style={{ fontSize: "0.74rem" }}>
+          Gate 1 Latency: {lastLocalMs !== null ? `${lastLocalMs}ms` : "—"} · Cloud Audit:{" "}
+          {lastCloudMs !== null ? `${lastCloudMs}ms` : "—"} · Offline Queue:{" "}
+          <strong style={{ color: pendingQueue.length > 0 ? "#fbbf24" : "#34d399" }}>
+            {pendingQueue.length} {pendingQueue.length === 1 ? "PENDING_SYNC" : "PENDING"}
+          </strong>
+        </span>
+      </div>
 
       {errorMsg && <div className="alert-red" style={{ marginBottom: 14 }}>{errorMsg}</div>}
 
@@ -700,6 +928,92 @@ export default function App() {
               ? "Running 3-Gate Local Airlock..."
               : "Run Local Airlock (Gate 1 + Nano Gate 2 + Gate 3)"}
           </button>
+
+          {/* PASSPHRASE-LOCKED .AIRLOCK.ENC VAULT EXPORT & RESTORE */}
+          <div style={{ borderTop: "1px solid var(--border)", paddingTop: 10 }}>
+            <div className="muted" style={{ marginBottom: 6 }}>
+              <KeyRound size={13} style={{ verticalAlign: "middle", marginRight: 5 }} />
+              <strong>Encrypted Local Vault (.airlock.enc)</strong> — PBKDF2 (100k) + AES-256-GCM
+            </div>
+            <div className="row" style={{ gap: 6 }}>
+              <input
+                type="password"
+                value={vaultPassphrase}
+                onChange={(e) => setVaultPassphrase(e.target.value)}
+                placeholder="Vault passphrase (min 6 chars)..."
+                style={{
+                  flex: 1,
+                  minWidth: 160,
+                  background: "#0b1220",
+                  color: "var(--text)",
+                  border: "1px solid var(--border)",
+                  borderRadius: 6,
+                  padding: "5px 8px",
+                  fontSize: "0.75rem",
+                }}
+              />
+              <button
+                type="button"
+                onClick={() => void handleExportEncryptedVault()}
+                disabled={!verifiedPayload || vaultPassphrase.trim().length < 6}
+                style={{ padding: "5px 9px", fontSize: "0.72rem" }}
+              >
+                <Download size={12} /> Export .airlock.enc
+              </button>
+              <label
+                style={{
+                  cursor: "pointer",
+                  fontSize: "0.72rem",
+                  padding: "5px 9px",
+                  borderRadius: 8,
+                  border: "1px solid var(--border)",
+                  background: "var(--panel-alt)",
+                  fontWeight: 600,
+                }}
+              >
+                Restore .airlock.enc
+                <input
+                  type="file"
+                  accept=".enc,.json"
+                  onChange={(e) => void handleRestoreEncryptedVault(e)}
+                  style={{ display: "none" }}
+                />
+              </label>
+            </div>
+
+            {vaultStatus && (
+              <div
+                className={vaultStatus.ok ? "alert-green" : "alert-red"}
+                style={{ marginTop: 8, fontSize: "0.75rem" }}
+              >
+                {vaultStatus.message}
+              </div>
+            )}
+
+            {restoredVault && (
+              <div className="wire-item" style={{ marginTop: 8, gap: 6 }}>
+                <div className="row" style={{ justifyContent: "space-between" }}>
+                  <span style={{ fontWeight: 700, fontSize: "0.74rem" }}>
+                    Restored Vault ({restoredVault.entries.length} tokens · Receipt{" "}
+                    <span className="mono">{restoredVault.receiptSha256.slice(0, 12)}…</span>)
+                  </span>
+                  <button
+                    type="button"
+                    onClick={() => setShowRestoredRehydrated((v) => !v)}
+                    style={{ padding: "3px 8px", fontSize: "0.7rem" }}
+                  >
+                    {showRestoredRehydrated ? <Eye size={12} /> : <EyeOff size={12} />}
+                    {showRestoredRehydrated ? "Restored Re-Hydrated" : "Sanitized Skeleton"}
+                  </button>
+                </div>
+                <div className="codebox" style={{ maxHeight: 140 }}>
+                  {showRestoredRehydrated
+                    ? rehydrateWithEntries(restoredSourceText, restoredVault.entries)
+                    : restoredSourceText}
+                </div>
+              </div>
+            )}
+          </div>
         </section>
 
         {/* CENTER COLUMN: SANITIZED AIRLOCK, RESIDUAL GUARD, RED-TEAM LAB & RE-HYDRATED AUDIT */}
@@ -884,6 +1198,14 @@ export default function App() {
               <div className="row">
                 <button
                   type="button"
+                  onClick={handleQueueOfflineReceipt}
+                  disabled={busy !== null || !verifiedPayload}
+                >
+                  <WifiOff size={15} />
+                  Queue Offline Receipt (0B Cloud)
+                </button>
+                <button
+                  type="button"
                   onClick={handleOfflineTriage}
                   disabled={busy !== null || !verifiedPayload || !isFirebaseConfigured || isCloudGatedByResidual}
                 >
@@ -1032,7 +1354,7 @@ export default function App() {
           )}
         </section>
 
-        {/* RIGHT COLUMN: LIVE WIRE TAP & FIRESTORE HASH-CHAINED LEDGER */}
+        {/* RIGHT COLUMN: LIVE WIRE TAP, OFFLINE-SYNC LEDGER & ZERO-TRUST EXTERNAL PROOF AUDITOR */}
         <section className="card">
           <h2>
             <span>
@@ -1044,7 +1366,7 @@ export default function App() {
             </button>
           </h2>
 
-          <div style={{ display: "flex", flexDirection: "column", gap: 8, maxHeight: 340, overflowY: "auto" }}>
+          <div style={{ display: "flex", flexDirection: "column", gap: 8, maxHeight: 300, overflowY: "auto" }}>
             {wireEvents.length === 0 ? (
               <div className="muted">No telemetry yet. Run Local Airlock to observe 0-byte local processing.</div>
             ) : (
@@ -1077,10 +1399,21 @@ export default function App() {
             <div className="row" style={{ justifyContent: "space-between", alignItems: "center", marginBottom: 8 }}>
               <h2 style={{ margin: 0 }}>Firestore Zero-PII Audit Ledger</h2>
               <div className="row" style={{ gap: 6 }}>
+                {pendingQueue.length > 0 && (
+                  <button
+                    type="button"
+                    className="cloud"
+                    onClick={() => void runQueueFlush("manual")}
+                    disabled={busy !== null || !isOnline || !isFirebaseConfigured}
+                    style={{ padding: "4px 8px", fontSize: "0.72rem" }}
+                  >
+                    <RefreshCw size={12} /> Flush Queue ({pendingQueue.length})
+                  </button>
+                )}
                 <button
                   type="button"
                   onClick={() => handleVerifyChain(false)}
-                  disabled={ledger.length === 0}
+                  disabled={combinedLedger.length === 0}
                   style={{ padding: "4px 8px", fontSize: "0.72rem" }}
                 >
                   Verify Chain
@@ -1089,7 +1422,7 @@ export default function App() {
                   type="button"
                   className="danger"
                   onClick={() => handleVerifyChain(true)}
-                  disabled={ledger.length === 0}
+                  disabled={combinedLedger.length === 0}
                   style={{ padding: "4px 8px", fontSize: "0.72rem" }}
                 >
                   1-Byte Tamper
@@ -1097,13 +1430,19 @@ export default function App() {
                 <button
                   type="button"
                   onClick={handleExportProofBundle}
-                  disabled={ledger.length === 0 && !verifiedPayload}
+                  disabled={combinedLedger.length === 0 && !verifiedPayload}
                   style={{ padding: "4px 8px", fontSize: "0.72rem" }}
                 >
                   <Download size={12} /> Proof JSON
                 </button>
               </div>
             </div>
+
+            {queueStatusMsg && (
+              <div className="wire-item" style={{ marginBottom: 8, fontSize: "0.75rem", color: "#fbbf24" }}>
+                {queueStatusMsg}
+              </div>
+            )}
 
             {chainReport && (
               <div
@@ -1123,15 +1462,15 @@ export default function App() {
               </div>
             )}
 
-            {ledger.length === 0 ? (
+            {combinedLedger.length === 0 ? (
               <div className="muted">
-                Append-only SHA-256 receipts sync here after your first Cloud Audit (raw PII is rejected by
-                server-side Firestore Security Rules).
+                Append-only SHA-256 receipts sync here after your first Cloud Audit or Offline Queue entry.
               </div>
             ) : (
               <div style={{ display: "flex", flexDirection: "column", gap: 6 }}>
-                {ledger.map((item, idx) => {
+                {combinedLedger.map((item, idx) => {
                   const isExpanded = expandedDocId === item.docId;
+                  const isPending = item.syncStatus === "PENDING_SYNC";
                   return (
                     <div
                       key={item.docId || item.receiptSha256}
@@ -1142,9 +1481,14 @@ export default function App() {
                     >
                       <div className="row" style={{ justifyContent: "space-between" }}>
                         <strong>
-                          #{ledger.length - idx} {item.policyProfile} · {item.riskLevel}
+                          #{combinedLedger.length - idx} {item.policyProfile} · {item.riskLevel}
                         </strong>
-                        <span className="mono muted">{item.receiptSha256.slice(0, 14)}…</span>
+                        <div className="row" style={{ gap: 6 }}>
+                          <span className={`badge ${isPending ? "amber" : "green"}`} style={{ padding: "2px 7px", fontSize: "0.66rem" }}>
+                            {isPending ? "PENDING_SYNC" : "SYNCED"}
+                          </span>
+                          <span className="mono muted">{item.receiptSha256.slice(0, 14)}…</span>
+                        </div>
                       </div>
                       <div className="muted">{item.sanitizedSummary}</div>
                       <div className="mono muted" style={{ fontSize: "0.7rem", marginTop: 2 }}>
@@ -1187,6 +1531,47 @@ export default function App() {
                 })}
               </div>
             )}
+
+            {/* ZERO-TRUST EXTERNAL PROOF JSON AUDITOR (100% OFFLINE) */}
+            <div style={{ borderTop: "1px solid var(--border)", paddingTop: 10, marginTop: 12 }}>
+              <div className="row" style={{ justifyContent: "space-between", alignItems: "center" }}>
+                <span className="muted" style={{ fontSize: "0.76rem" }}>
+                  <FileCheck2 size={13} style={{ verticalAlign: "middle", marginRight: 5 }} />
+                  <strong>Zero-Trust External Proof Auditor</strong> (Offline)
+                </span>
+                <label
+                  style={{
+                    cursor: "pointer",
+                    fontSize: "0.72rem",
+                    padding: "4px 8px",
+                    borderRadius: 6,
+                    border: "1px solid var(--border)",
+                    background: "var(--panel-alt)",
+                    fontWeight: 600,
+                  }}
+                >
+                  Verify Proof JSON File
+                  <input
+                    type="file"
+                    accept=".json,application/json"
+                    onChange={(e) => void handleAuditExternalProofFile(e)}
+                    style={{ display: "none" }}
+                  />
+                </label>
+              </div>
+              {externalProofReport && (
+                <div
+                  className={externalProofReport.ok ? "alert-green" : "alert-red"}
+                  style={{ marginTop: 8, fontSize: "0.75rem" }}
+                >
+                  <div><strong>{externalProofReport.verdict}</strong></div>
+                  <div className="mono" style={{ fontSize: "0.7rem", marginTop: 3 }}>
+                    file: {externalProofReport.fileName} · project: {externalProofReport.projectId} · zeroPii:{" "}
+                    {String(externalProofReport.zeroPiiClean)}
+                  </div>
+                </div>
+              )}
+            </div>
           </div>
         </section>
       </div>
