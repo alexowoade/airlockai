@@ -81,20 +81,20 @@ function getHandles(): ExtensionHandles | null {
 
   const app = initializeApp(firebaseConfig);
 
-  // MV3 CSP blocks remote reCAPTCHA scripts; use debug token + CustomProvider cleanly
-  const debugToken =
-    (import.meta.env.VITE_EXTENSION_APPCHECK_DEBUG_TOKEN as string | undefined) || true;
-  (self as unknown as Record<string, unknown>).FIREBASE_APPCHECK_DEBUG_TOKEN = debugToken;
-
-  initializeAppCheck(app, {
-    provider: new CustomProvider({
-      getToken: async () => ({
-        token: typeof debugToken === "string" ? debugToken : "mv3-debug-token",
-        expireTimeMillis: Date.now() + 60 * 60 * 1000,
-      }),
-    }),
-    isTokenAutoRefreshEnabled: true,
-  });
+  // MV3 CSP blocks remote reCAPTCHA scripts; only initialize App Check when a registered debug token is configured
+    const debugToken = import.meta.env.VITE_EXTENSION_APPCHECK_DEBUG_TOKEN as string | undefined;
+    if (debugToken && debugToken.trim().length > 0) {
+      (self as unknown as Record<string, unknown>).FIREBASE_APPCHECK_DEBUG_TOKEN = debugToken.trim();
+      initializeAppCheck(app, {
+        provider: new CustomProvider({
+          getToken: async () => ({
+            token: debugToken.trim(),
+            expireTimeMillis: Date.now() + 60 * 60 * 1000,
+          }),
+        }),
+        isTokenAutoRefreshEnabled: false,
+      });
+    }
 
   const auth = getAuth(app);
   const db = getFirestore(app);

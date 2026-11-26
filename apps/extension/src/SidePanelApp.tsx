@@ -273,18 +273,27 @@ export default function SidePanelApp() {
   }
 
   async function handleReplaceOnPage() {
-    if (!verified) return;
+    if (!verified || !airlock) return;
     setErrorMsg(null);
+    setStatusMsg(null);
     try {
-      const [tab] = await chrome.tabs.query({ active: true, currentWindow: true });
+      let [tab] = await chrome.tabs.query({ active: true, lastFocusedWindow: true });
+      if (!tab?.id) [tab] = await chrome.tabs.query({ active: true, currentWindow: true });
       if (!tab?.id) {
         setErrorMsg("No active browser tab found.");
         return;
       }
+      const vaultPairs: Array<[string, string]> = airlock.vault
+        .getEntries(false)
+        .map((e) => [String(e.original ?? ""), String(e.token ?? "")] as [string, string])
+        .filter(([raw, tok]) => raw.length >= 3 && tok.length > 0)
+        .sort((a, b) => b[0].length - a[0].length);
+
       const results = await chrome.scripting.executeScript({
-        target: { tabId: tab.id },
-        args: [rawText, verified.sanitizedText],
-        func: (rawNeedle: string, safeText: string) => {
+        target: { tabId: tab.id, allFrames: true },
+        args: [rawText, verified.sanitizedText, vaultPairs],
+        func: (rawNeedle: string, safeText: string, pairs: Array<[string, string]>) => {
+          const esc = (s: string) => s.replace(/[.*+?^${}()|[\]\\]/g, "\\$&");
           const setNative = (field: HTMLInputElement | HTMLTextAreaElement, next: string) => {
             const proto = field.tagName === "TEXTAREA" ? HTMLTextAreaElement.prototype : HTMLInputElement.prototype;
             const desc = Object.getOwnPropertyDescriptor(proto, "value");
@@ -293,40 +302,81 @@ export default function SidePanelApp() {
             field.dispatchEvent(new Event("input", { bubbles: true }));
             field.dispatchEvent(new Event("change", { bubbles: true }));
           };
-          const needle = rawNeedle.trim();
           const fields = Array.from(
             document.querySelectorAll<HTMLInputElement | HTMLTextAreaElement>(
               'textarea, input:not([type]), input[type="text"], input[type="search"], input[type="email"], input[type="url"]'
             )
+          );
+          const editables = Array.from(
+            document.querySelectorAll<HTMLElement>('[contenteditable="true"], [contenteditable=""]')
           );
           const active = document.activeElement as HTMLInputElement | HTMLTextAreaElement | HTMLElement | null;
           if (active && (active.tagName === "TEXTAREA" || active.tagName === "INPUT")) {
             const idx = fields.indexOf(active as HTMLInputElement | HTMLTextAreaElement);
             if (idx > 0) { fields.splice(idx, 1); fields.unshift(active as HTMLInputElement | HTMLTextAreaElement); }
           }
-          if (needle.length > 0) {
+
+          const needle = rawNeedle.trim();
+          const wsRegex = needle.length > 0 ? new RegExp(needle.split(/\s+/).map(esc).join("\\s+")) : null;
+
+          // Pass 1: Exact or whitespace-flexible match of staged text
+          if (needle.length > 0 && wsRegex) {
             for (const f of fields) {
               if (f.value.includes(needle)) {
                 setNative(f, f.value.replace(needle, safeText));
-                return { replaced: true, target: f.tagName.toLowerCase() };
+                return { replaced: true, target: f.tagName.toLowerCase(), count: pairs.length };
+              }
+              if (wsRegex.test(f.value)) {
+                setNative(f, f.value.replace(wsRegex, safeText));
+                return { replaced: true, target: f.tagName.toLowerCase(), count: pairs.length };
               }
             }
-            const editables = Array.from(document.querySelectorAll<HTMLElement>('[contenteditable="true"], [contenteditable=""]'));
             for (const ed of editables) {
-              if ((ed.innerText || "").includes(needle)) {
-                ed.innerText = ed.innerText.replace(needle, safeText);
+              const txt = ed.innerText || "";
+              if (txt.includes(needle) || wsRegex.test(txt)) {
+                ed.innerText = txt.includes(needle) ? txt.replace(needle, safeText) : txt.replace(wsRegex, safeText);
                 ed.dispatchEvent(new Event("input", { bubbles: true }));
-                return { replaced: true, target: "contentEditable" };
+                return { replaced: true, target: "contentEditable", count: pairs.length };
               }
             }
           }
+
+          // Pass 2: Per-entity vault scrub across inputs/textareas/contentEditable
+          if (pairs.length > 0) {
+            for (const f of fields) {
+              let next = f.value;
+              let hits = 0;
+              for (const [raw, tok] of pairs) {
+                const r = new RegExp(esc(raw), "g");
+                if (r.test(next)) { next = next.replace(r, tok); hits += 1; }
+              }
+              if (hits > 0) {
+                setNative(f, next);
+                return { replaced: true, target: f.tagName.toLowerCase(), count: hits };
+              }
+            }
+            for (const ed of editables) {
+              let next = ed.innerText || "";
+              let hits = 0;
+              for (const [raw, tok] of pairs) {
+                const r = new RegExp(esc(raw), "g");
+                if (r.test(next)) { next = next.replace(r, tok); hits += 1; }
+              }
+              if (hits > 0) {
+                ed.innerText = next;
+                ed.dispatchEvent(new Event("input", { bubbles: true }));
+                return { replaced: true, target: "contentEditable", count: hits };
+              }
+            }
+          }
+
+          // Pass 3: Focused field or active selection fallback
           if (active && (active.tagName === "TEXTAREA" || (active.tagName === "INPUT" && ["text", "search", "email", "url", ""].includes((active as HTMLInputElement).type)))) {
             const f = active as HTMLInputElement | HTMLTextAreaElement;
             const s = f.selectionStart ?? 0;
             const e = f.selectionEnd ?? 0;
-            const next = e > s ? f.value.slice(0, s) + safeText + f.value.slice(e) : safeText;
-            setNative(f, next);
-            return { replaced: true, target: f.tagName.toLowerCase() };
+            setNative(f, e > s ? f.value.slice(0, s) + safeText + f.value.slice(e) : safeText);
+            return { replaced: true, target: f.tagName.toLowerCase(), count: pairs.length };
           }
           const sel = window.getSelection();
           if (sel && sel.rangeCount > 0 && !sel.isCollapsed) {
@@ -334,20 +384,25 @@ export default function SidePanelApp() {
             range.deleteContents();
             range.insertNode(document.createTextNode(safeText));
             sel.collapseToEnd();
-            return { replaced: true, target: "page selection" };
+            return { replaced: true, target: "page selection", count: pairs.length };
           }
-          return { replaced: false, target: "none" };
+          return { replaced: false, target: "none", count: 0 };
         },
       });
-      const outcome = results[0]?.result as { replaced: boolean; target: string } | undefined;
+
+      const outcome = results
+        .map((r) => r.result as { replaced: boolean; target: string; count: number } | undefined)
+        .find((r) => r?.replaced);
       if (outcome?.replaced) {
-        setStatusMsg(`Scrubbed in-place on active page (${outcome.target}) - 0B raw PII leaked.`);
+        setStatusMsg(`Scrubbed in-place on active page (${outcome.target}, ${outcome.count} tokens) - 0B raw PII leaked.`);
       } else {
-        setErrorMsg("Focus a text box or paste matching text on the page first, then click Replace on Page.");
+        setErrorMsg("No matching text box or selection found on this page. Click Grab Active Tab or focus a text field first.");
       }
+      window.scrollTo({ top: 0, behavior: "smooth" });
     } catch (err) {
       const detail = err instanceof Error ? err.message : "unknown error";
       setErrorMsg(`Cannot modify this tab (${detail}). Open any standard http/https webpage.`);
+      window.scrollTo({ top: 0, behavior: "smooth" });
     }
   }
 
