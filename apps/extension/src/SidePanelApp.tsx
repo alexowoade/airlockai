@@ -283,41 +283,57 @@ export default function SidePanelApp() {
       }
       const results = await chrome.scripting.executeScript({
         target: { tabId: tab.id },
-        args: [verified.sanitizedText],
-        func: (safeText: string) => {
-          const el = document.activeElement as
-            | HTMLInputElement
-            | HTMLTextAreaElement
-            | HTMLElement
-            | null;
-          if (
-            el &&
-            (el.tagName === "TEXTAREA" ||
-              (el.tagName === "INPUT" &&
-                ["text", "search", "email", "url"].includes((el as HTMLInputElement).type)))
-          ) {
-            const field = el as HTMLInputElement | HTMLTextAreaElement;
-            const start = field.selectionStart ?? 0;
-            const end = field.selectionEnd ?? 0;
-            if (end > start) {
-              field.setRangeText(safeText, start, end, "end");
-            } else {
-              field.value = safeText;
-            }
+        args: [rawText, verified.sanitizedText],
+        func: (rawNeedle: string, safeText: string) => {
+          const setNative = (field: HTMLInputElement | HTMLTextAreaElement, next: string) => {
+            const proto = field.tagName === "TEXTAREA" ? HTMLTextAreaElement.prototype : HTMLInputElement.prototype;
+            const desc = Object.getOwnPropertyDescriptor(proto, "value");
+            if (desc?.set) desc.set.call(field, next);
+            else field.value = next;
             field.dispatchEvent(new Event("input", { bubbles: true }));
-            return { replaced: true, target: field.tagName.toLowerCase() };
+            field.dispatchEvent(new Event("change", { bubbles: true }));
+          };
+          const needle = rawNeedle.trim();
+          const fields = Array.from(
+            document.querySelectorAll<HTMLInputElement | HTMLTextAreaElement>(
+              'textarea, input:not([type]), input[type="text"], input[type="search"], input[type="email"], input[type="url"]'
+            )
+          );
+          const active = document.activeElement as HTMLInputElement | HTMLTextAreaElement | HTMLElement | null;
+          if (active && (active.tagName === "TEXTAREA" || active.tagName === "INPUT")) {
+            const idx = fields.indexOf(active as HTMLInputElement | HTMLTextAreaElement);
+            if (idx > 0) { fields.splice(idx, 1); fields.unshift(active as HTMLInputElement | HTMLTextAreaElement); }
           }
-
+          if (needle.length > 0) {
+            for (const f of fields) {
+              if (f.value.includes(needle)) {
+                setNative(f, f.value.replace(needle, safeText));
+                return { replaced: true, target: f.tagName.toLowerCase() };
+              }
+            }
+            const editables = Array.from(document.querySelectorAll<HTMLElement>('[contenteditable="true"], [contenteditable=""]'));
+            for (const ed of editables) {
+              if ((ed.innerText || "").includes(needle)) {
+                ed.innerText = ed.innerText.replace(needle, safeText);
+                ed.dispatchEvent(new Event("input", { bubbles: true }));
+                return { replaced: true, target: "contentEditable" };
+              }
+            }
+          }
+          if (active && (active.tagName === "TEXTAREA" || (active.tagName === "INPUT" && ["text", "search", "email", "url", ""].includes((active as HTMLInputElement).type)))) {
+            const f = active as HTMLInputElement | HTMLTextAreaElement;
+            const s = f.selectionStart ?? 0;
+            const e = f.selectionEnd ?? 0;
+            const next = e > s ? f.value.slice(0, s) + safeText + f.value.slice(e) : safeText;
+            setNative(f, next);
+            return { replaced: true, target: f.tagName.toLowerCase() };
+          }
           const sel = window.getSelection();
           if (sel && sel.rangeCount > 0 && !sel.isCollapsed) {
             const range = sel.getRangeAt(0);
             range.deleteContents();
             range.insertNode(document.createTextNode(safeText));
             sel.collapseToEnd();
-            if (el && el.isContentEditable) {
-              el.dispatchEvent(new Event("input", { bubbles: true }));
-              return { replaced: true, target: "contentEditable" };
-            }
             return { replaced: true, target: "page selection" };
           }
           return { replaced: false, target: "none" };
@@ -325,12 +341,13 @@ export default function SidePanelApp() {
       });
       const outcome = results[0]?.result as { replaced: boolean; target: string } | undefined;
       if (outcome?.replaced) {
-        setStatusMsg(`Scrubbed in-place on active page (${outcome.target}) — 0B raw PII leaked.`);
+        setStatusMsg(`Scrubbed in-place on active page (${outcome.target}) - 0B raw PII leaked.`);
       } else {
-        setErrorMsg("Focus a text box or highlight text on the page first, then click Replace on Page.");
+        setErrorMsg("Focus a text box or paste matching text on the page first, then click Replace on Page.");
       }
-    } catch {
-      setErrorMsg("Cannot modify protected chrome:// tabs. Open any standard webpage or compose box.");
+    } catch (err) {
+      const detail = err instanceof Error ? err.message : "unknown error";
+      setErrorMsg(`Cannot modify this tab (${detail}). Open any standard http/https webpage.`);
     }
   }
 

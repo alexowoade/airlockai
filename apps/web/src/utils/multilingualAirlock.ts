@@ -86,7 +86,7 @@ const LANG_LABELS: Record<SupportedLanguageCode, string> = {
 const LANG_STOPWORDS: Record<SupportedLanguageCode, ReadonlyArray<string>> = {
   de: ["und", "für", "bis", "zum", "auf", "der", "die", "das", "haftung", "überweisung", "vereinbarung", "auftraggeber", "vertrauliche", "projekt"],
   fr: ["et", "pour", "avant", "vers", "une", "des", "les", "contrat", "confidentialité", "responsabilité", "virement", "prestataire", "plafond", "projet"],
-  es: ["y", "de", "con", "hacia", "sin", "para", "anexo", "transferencia", "importe", "fecha", "cláusula", "proveedor", "pago", "proyecto"],
+  es: ["y", "de", "del", "el", "la", "con", "hacia", "sin", "para", "anexo", "transferencia", "importe", "fecha", "cláusula", "proveedor", "pago", "proyecto", "emisor", "receptor", "cuenta", "destino", "urgente", "riesgo", "entrega", "firmante", "correo"],
   en: ["the", "and", "between", "shall", "under", "agreement", "invoice", "liability", "contract", "wire", "payment", "project"],
 };
 
@@ -143,6 +143,25 @@ export async function detectLanguageLocally(text: string): Promise<LanguageDetec
     return { code: "en", label: LANG_LABELS.en, confidence: 1, engine: "LOCAL_HEURISTIC_CLASSIFIER" };
   }
 
+  const lower = trimmed.toLowerCase();
+  const tokens = lower.split(/[^a-zà-öø-ÿ]+/).filter(Boolean);
+  const scores: Record<SupportedLanguageCode, number> = { en: 0, de: 0, fr: 0, es: 0 };
+  for (const tok of tokens) {
+    for (const lang of ["de", "fr", "es", "en"] as const) {
+      if (LANG_STOPWORDS[lang].includes(tok)) scores[lang] += 1;
+    }
+  }
+  let heurBest: SupportedLanguageCode = "en";
+  let heurScore = scores.en;
+  for (const lang of ["de", "fr", "es"] as const) {
+    if (scores[lang] > heurScore) {
+      heurBest = lang;
+      heurScore = scores[lang];
+    }
+  }
+  const totalHits = scores.en + scores.de + scores.fr + scores.es;
+  const heurConf = totalHits > 0 ? Number(Math.min(0.99, heurScore / totalHits + 0.15).toFixed(2)) : 0.85;
+
   const g = globalThis as unknown as { LanguageDetector?: ChromeDetectorGlobal };
   try {
     if (g.LanguageDetector?.availability && g.LanguageDetector?.create) {
@@ -150,48 +169,31 @@ export async function detectLanguageLocally(text: string): Promise<LanguageDetec
       if (avail === "available") {
         const det = await g.LanguageDetector.create();
         const ranked = await det.detect(trimmed.slice(0, 1200));
-        if (ranked.length > 0 && ranked[0]) {
-          const code = toSupportedCode(ranked[0].detectedLanguage);
-          return {
-            code,
-            label: LANG_LABELS[code],
-            confidence: Number(Math.min(0.99, Math.max(0.5, ranked[0].confidence)).toFixed(2)),
-            engine: "CHROME_LANGUAGE_DETECTOR",
-          };
+        const match = ranked.slice(0, 3).find((r) => {
+          const b = r.detectedLanguage.toLowerCase().slice(0, 2);
+          return b === "en" || b === "de" || b === "fr" || b === "es";
+        });
+        if (match && match.confidence >= 0.7) {
+          const code = toSupportedCode(match.detectedLanguage);
+          if (!(code === "en" && heurBest !== "en" && heurScore >= 4 && scores.en === 0)) {
+            return {
+              code,
+              label: LANG_LABELS[code],
+              confidence: Number(Math.min(0.99, match.confidence).toFixed(2)),
+              engine: "CHROME_LANGUAGE_DETECTOR",
+            };
+          }
         }
       }
     }
   } catch {
-    // Fallback cleanly to deterministic local classifier
+    // Fall through cleanly to deterministic local classifier
   }
-
-  const lower = trimmed.toLowerCase();
-  const tokens = lower.split(/[^a-zà-öø-ÿ]+/).filter(Boolean);
-  const scores: Record<SupportedLanguageCode, number> = { en: 0, de: 0, fr: 0, es: 0 };
-
-  for (const tok of tokens) {
-    for (const lang of ["de", "fr", "es", "en"] as const) {
-      if (LANG_STOPWORDS[lang].includes(tok)) {
-        scores[lang] += 1;
-      }
-    }
-  }
-
-  let best: SupportedLanguageCode = "en";
-  let bestScore = scores.en;
-  for (const lang of ["de", "fr", "es"] as const) {
-    if (scores[lang] > bestScore) {
-      best = lang;
-      bestScore = scores[lang];
-    }
-  }
-  const totalHits = scores.en + scores.de + scores.fr + scores.es;
-  const confidence = totalHits > 0 ? Number(Math.min(0.99, bestScore / totalHits + 0.15).toFixed(2)) : 0.85;
 
   return {
-    code: best,
-    label: LANG_LABELS[best],
-    confidence,
+    code: heurBest,
+    label: LANG_LABELS[heurBest],
+    confidence: heurConf,
     engine: "LOCAL_HEURISTIC_CLASSIFIER",
   };
 }
