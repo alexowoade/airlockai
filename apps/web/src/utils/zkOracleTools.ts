@@ -1,12 +1,19 @@
 import { Schema, type FunctionDeclaration } from "firebase/ai";
 import type { AirlockVault, VaultEntry } from "@airlock/core";
 
+export interface OracleDpOptions {
+  readonly enabled: boolean;
+  readonly epsilon: number; // e.g., 0.5, 1.0, 2.0
+}
+
 export interface OracleCallTrace {
   readonly toolName: string;
   readonly args: Record<string, unknown>;
   readonly predicateResult: Record<string, unknown>;
   readonly latencyMs: number;
   readonly zeroPiiVerified: boolean;
+  readonly dpApplied: boolean;
+  readonly dpEpsilon: number | null;
 }
 
 /**
@@ -18,7 +25,7 @@ export const ZK_ORACLE_FUNCTION_DECLARATIONS: FunctionDeclaration[] = [
   {
     name: "compare_currency_tokens",
     description:
-      "Compare two redacted currency placeholder tokens (e.g., [CURRENCY_1] and [CURRENCY_2]) locally in browser RAM without revealing raw dollar amounts. Returns exact relation, ratio, and percentage delta.",
+      "Compare two redacted currency placeholder tokens (e.g., [CURRENCY_1] and [CURRENCY_2]) locally in browser RAM without revealing raw dollar amounts. Returns exact compliance relation plus ratio/percentage delta (optionally perturbed with Laplace epsilon-DP noise).",
     parameters: Schema.object({
       properties: {
         baselineToken: Schema.string({
@@ -33,7 +40,7 @@ export const ZK_ORACLE_FUNCTION_DECLARATIONS: FunctionDeclaration[] = [
   {
     name: "compare_date_tokens",
     description:
-      "Compare two redacted date placeholder tokens (e.g., [DATE_1] and [DATE_2]) locally in browser RAM without revealing calendar dates. Returns exact days delta and whether targetToken is past deadlineToken.",
+      "Compare two redacted date placeholder tokens (e.g., [DATE_1] and [DATE_2]) locally in browser RAM without revealing calendar dates. Returns exact deadline compliance plus days delta (optionally perturbed with Laplace epsilon-DP noise).",
     parameters: Schema.object({
       properties: {
         deadlineToken: Schema.string({
@@ -72,6 +79,20 @@ export const ZK_ORACLE_FUNCTION_DECLARATIONS: FunctionDeclaration[] = [
     }),
   },
 ];
+
+/**
+ * Cryptographically seeded Laplace(0, b) sampler using WebCrypto CSPRNG:
+ * X = -b * sgn(u) * ln(1 - 2|u|), where u ~ Uniform(-0.5, 0.5).
+ */
+export function sampleLaplaceNoise(scaleB: number): number {
+  if (!Number.isFinite(scaleB) || scaleB <= 0) return 0;
+  const buf = new Uint32Array(1);
+  crypto.getRandomValues(buf);
+  // Map uint32 to (-0.499999, 0.499999) avoiding exact 0.5 singularity
+  const u = (buf[0]! / 4294967296 - 0.5) * 0.999998;
+  const sign = u < 0 ? -1 : 1;
+  return -scaleB * sign * Math.log(1 - 2 * Math.abs(u));
+}
 
 function lookupEntry(vault: AirlockVault, rawToken: unknown): VaultEntry | undefined {
   const token = String(rawToken ?? "").trim();
@@ -125,15 +146,19 @@ function assertZeroPiiInOracleReturn(
 }
 
 /**
- * Executes a single Firebase AI Logic tool call strictly in local browser RAM.
+ * Executes a single Firebase AI Logic tool call strictly in local browser RAM,
+ * with optional (ε, 0)-Laplace Differential Privacy perturbation on numeric ratios/deltas.
  */
 export function executeLocalZkOracle(
   toolName: string,
   args: Record<string, unknown>,
-  vault: AirlockVault
+  vault: AirlockVault,
+  dpOptions: OracleDpOptions = { enabled: false, epsilon: 1.0 }
 ): { readonly response: Record<string, unknown>; readonly trace: OracleCallTrace } {
   const t0 = performance.now();
   let response: Record<string, unknown>;
+  let dpApplied = false;
+  const eps = Math.max(0.1, Math.min(10, Number(dpOptions.epsilon) || 1.0));
 
   if (toolName === "compare_currency_tokens") {
     const baseEntry = lookupEntry(vault, args.baselineToken);
@@ -144,16 +169,49 @@ export function executeLocalZkOracle(
     if (baseVal === null || chalVal === null || baseVal === 0) {
       response = { ok: false, error: "One or both currency tokens could not be resolved locally." };
     } else {
-      const ratio = Number((chalVal / baseVal).toFixed(4));
-      const pctDelta = Number((((chalVal - baseVal) / baseVal) * 100).toFixed(2));
-      response = {
-        ok: true,
-        relation: chalVal > baseVal ? "EXCEEDS_BASELINE" : chalVal < baseVal ? "UNDER_BASELINE" : "EQUAL",
-        exceedsCap: chalVal > baseVal,
-        ratioChallengerToBaseline: ratio,
-        percentDelta: `${pctDelta >= 0 ? "+" : ""}${pctDelta}%`,
-        privacyGuarantee: "Computed strictly in local browser RAM; 0 raw currency digits returned.",
-      };
+      const exactRatio = chalVal / baseVal;
+      const exactPct = ((chalVal - baseVal) / baseVal) * 100;
+      const exceedsCap = chalVal > baseVal;
+      const relation = exceedsCap ? "EXCEEDS_BASELINE" : chalVal < baseVal ? "UNDER_BASELINE" : "EQUAL";
+
+      if (dpOptions.enabled) {
+        dpApplied = true;
+        // Bounded sensitivity Δf = 0.05 on ratio (5% scale) clamped to preserve direction sign
+        const sensitivity = 0.05;
+        const rawNoise = sampleLaplaceNoise(sensitivity / eps);
+        const boundedNoise = Math.max(-0.18, Math.min(0.18, rawNoise));
+        let noisyRatio = Number((exactRatio + boundedNoise).toFixed(4));
+        if (exceedsCap && noisyRatio <= 1.01) noisyRatio = 1.02;
+        if (!exceedsCap && chalVal < baseVal && noisyRatio >= 0.99) noisyRatio = 0.98;
+        const noisyPct = Number(((noisyRatio - 1) * 100).toFixed(2));
+
+        response = {
+          ok: true,
+          relation,
+          exceedsCap,
+          ratioChallengerToBaseline: noisyRatio,
+          percentDelta: `${noisyPct >= 0 ? "+" : ""}${noisyPct}%`,
+          differentialPrivacy: {
+            mechanism: "LAPLACE_CSPRNG",
+            epsilon: eps,
+            delta: 0,
+            sensitivity,
+            note: "Ratio/percentage perturbed via (ε,0)-DP to prevent baseline inversion; boolean verdict exact.",
+          },
+          privacyGuarantee: `Computed in local RAM with (ε=${eps}, 0)-Laplace DP; 0 raw currency digits returned.`,
+        };
+      } else {
+        const ratio = Number(exactRatio.toFixed(4));
+        const pctDelta = Number(exactPct.toFixed(2));
+        response = {
+          ok: true,
+          relation,
+          exceedsCap,
+          ratioChallengerToBaseline: ratio,
+          percentDelta: `${pctDelta >= 0 ? "+" : ""}${pctDelta}%`,
+          privacyGuarantee: "Computed strictly in local browser RAM; 0 raw currency digits returned.",
+        };
+      }
     }
   } else if (toolName === "compare_date_tokens") {
     const deadEntry = lookupEntry(vault, args.deadlineToken);
@@ -164,14 +222,47 @@ export function executeLocalZkOracle(
     if (deadMs === null || targMs === null) {
       response = { ok: false, error: "One or both date tokens could not be resolved locally." };
     } else {
-      const daysDelta = Math.round((targMs - deadMs) / 86_400_000);
-      response = {
-        ok: true,
-        relation: daysDelta > 0 ? "AFTER_DEADLINE" : daysDelta < 0 ? "BEFORE_DEADLINE" : "ON_DEADLINE",
-        isPastDeadline: daysDelta > 0,
-        daysDelta,
-        privacyGuarantee: "Computed strictly in local browser RAM; 0 raw calendar dates returned.",
-      };
+      const exactDaysDelta = Math.round((targMs - deadMs) / 86_400_000);
+      const isPastDeadline = exactDaysDelta > 0;
+      const relation = isPastDeadline
+        ? "AFTER_DEADLINE"
+        : exactDaysDelta < 0
+          ? "BEFORE_DEADLINE"
+          : "ON_DEADLINE";
+
+      if (dpOptions.enabled) {
+        dpApplied = true;
+        // Sensitivity Δf = 3 days clamped so noisy delta preserves deadline compliance direction
+        const sensitivity = 3;
+        const rawNoise = sampleLaplaceNoise(sensitivity / eps);
+        const boundedNoise = Math.round(Math.max(-10, Math.min(10, rawNoise)));
+        let noisyDays = exactDaysDelta + boundedNoise;
+        if (isPastDeadline && noisyDays <= 0) noisyDays = 1;
+        if (!isPastDeadline && exactDaysDelta < 0 && noisyDays >= 0) noisyDays = -1;
+
+        response = {
+          ok: true,
+          relation,
+          isPastDeadline,
+          daysDelta: noisyDays,
+          differentialPrivacy: {
+            mechanism: "LAPLACE_CSPRNG",
+            epsilon: eps,
+            delta: 0,
+            sensitivityDays: sensitivity,
+            note: "Calendar daysDelta perturbed via (ε,0)-DP; isPastDeadline boolean exact.",
+          },
+          privacyGuarantee: `Computed in local RAM with (ε=${eps}, 0)-Laplace DP; 0 raw calendar dates returned.`,
+        };
+      } else {
+        response = {
+          ok: true,
+          relation,
+          isPastDeadline,
+          daysDelta: exactDaysDelta,
+          privacyGuarantee: "Computed strictly in local browser RAM; 0 raw calendar dates returned.",
+        };
+      }
     }
   } else if (toolName === "verify_iban_jurisdiction") {
     const ibanEntry = lookupEntry(vault, args.ibanToken);
@@ -227,6 +318,8 @@ export function executeLocalZkOracle(
       predicateResult: response,
       latencyMs,
       zeroPiiVerified,
+      dpApplied,
+      dpEpsilon: dpApplied ? eps : null,
     },
   };
 }

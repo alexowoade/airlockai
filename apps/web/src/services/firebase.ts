@@ -22,12 +22,14 @@ import {
   GoogleAIBackend,
   InferenceMode,
   Schema,
+  ThinkingLevel,
   type AI,
   type GenerativeModel,
   type TemplateGenerativeModel,
 } from "firebase/ai";
 import type { AirlockReceipt, PolicyProfile } from "@airlock/core";
 import { ZK_ORACLE_FUNCTION_DECLARATIONS } from "../utils/zkOracleTools.js";
+import type { AirlockThinkingDepth } from "../utils/thinkingAudit.js";
 
 export interface AirlockPolicyConfig {
   readonly profile: PolicyProfile;
@@ -438,4 +440,43 @@ export async function runLayer4FirestoreAttack(
       latencyMs: Math.max(1, Math.round(performance.now() - t0)),
     };
   }
+}
+
+
+export function mapThinkingLevel(depth: AirlockThinkingDepth): ThinkingLevel {
+  if (depth === "LOW") return ThinkingLevel.LOW;
+  if (depth === "HIGH") return ThinkingLevel.HIGH;
+  return ThinkingLevel.MEDIUM;
+}
+
+export function createThinkingModel(params: {
+  ai: ReturnType<typeof getAI>;
+  depth: AirlockThinkingDepth;
+  withOracleTools?: boolean;
+  structuredSchema?: ReturnType<typeof Schema.object>;
+  maxOutputTokens?: number;
+}): GenerativeModel {
+  const depthTokenFloor =
+    params.depth === "HIGH" ? 8192 : params.depth === "MEDIUM" ? 4096 : 2048;
+  const effectiveMaxOutputTokens = Math.max(params.maxOutputTokens ?? 1600, depthTokenFloor);
+
+  return getGenerativeModel(params.ai, {
+    model: "gemini-3.5-flash-lite",
+    ...(params.withOracleTools
+      ? { tools: [{ functionDeclarations: ZK_ORACLE_FUNCTION_DECLARATIONS }] }
+      : {}),
+    generationConfig: {
+      maxOutputTokens: effectiveMaxOutputTokens,
+      ...(params.structuredSchema
+        ? {
+            responseMimeType: "application/json",
+            responseSchema: params.structuredSchema,
+          }
+        : {}),
+      thinkingConfig: {
+        thinkingLevel: mapThinkingLevel(params.depth),
+        includeThoughts: true,
+      },
+    },
+  });
 }

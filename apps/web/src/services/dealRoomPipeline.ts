@@ -11,10 +11,11 @@ import {
   type VerifiedSanitizedPayload,
 } from "@airlock/core";
 import type { Part } from "firebase/ai";
-import { getFirebaseHandles, writeZeroPiiAuditLedger } from "./firebase.js";
+import { createThinkingModel, getFirebaseHandles, writeZeroPiiAuditLedger } from "./firebase.js";
 import { wireTap } from "./wireTap.js";
 import { neutralizePromptInjections, type PromptInjectionReport } from "../utils/promptInjectionGuard.js";
-import { executeLocalZkOracle, type OracleCallTrace } from "../utils/zkOracleTools.js";
+import { executeLocalZkOracle, type OracleCallTrace, type OracleDpOptions } from "../utils/zkOracleTools.js";
+import { buildThinkingAuditTrace, type AirlockThinkingDepth, type ThinkingAuditTrace } from "../utils/thinkingAudit.js";
 
 export interface CoRefMatrixRow {
   readonly token: string;
@@ -41,6 +42,8 @@ export interface DealRoomOracleAuditOutput {
   readonly oracleTraces: ReadonlyArray<OracleCallTrace>;
   readonly toolRounds: number;
   readonly latencyMs: number;
+  readonly dpOptions: OracleDpOptions;
+  readonly thinkingTrace: ThinkingAuditTrace | null;
 }
 
 function propagateAcrossDoc(
@@ -165,6 +168,8 @@ export async function runDealRoomOracleAudit(params: {
   verified: VerifiedSanitizedPayload;
   vault: AirlockVault;
   policyProfile: PolicyProfile;
+  thinkingDepth?: AirlockThinkingDepth;
+  dpOptions?: OracleDpOptions;
   onLedgerSynced?: (docId: string) => void;
 }): Promise<DealRoomOracleAuditOutput> {
   const handles = getFirebaseHandles();
@@ -173,7 +178,8 @@ export async function runDealRoomOracleAudit(params: {
   }
 
   const t0 = performance.now();
-  const chat = handles.zkOracleModel.startChat();
+  const thinkingDepth: AirlockThinkingDepth = params.thinkingDepth ?? "MEDIUM";
+  const dpOptions: OracleDpOptions = params.dpOptions ?? { enabled: false, epsilon: 1.0 };
   const oracleTraces: OracleCallTrace[] = [];
 
   const prompt = [
@@ -191,7 +197,21 @@ export async function runDealRoomOracleAudit(params: {
     params.verified.sanitizedText,
   ].join("\n");
 
-  let result = await chat.sendMessage(prompt);
+  let chat = createThinkingModel({
+    ai: handles.ai,
+    depth: thinkingDepth,
+    withOracleTools: true,
+    maxOutputTokens: 1600,
+  }).startChat();
+
+  let result;
+  try {
+    result = await chat.sendMessage(prompt);
+  } catch {
+    // Graceful fallback if endpoint rejects thinkingConfig on function-calling turn
+    chat = handles.zkOracleModel.startChat();
+    result = await chat.sendMessage(prompt);
+  }
   let toolRounds = 0;
 
   while (toolRounds < 5) {
@@ -201,7 +221,7 @@ export async function runDealRoomOracleAudit(params: {
 
     const responseParts: Part[] = calls.map((call) => {
       const argsObj = (call.args ?? {}) as Record<string, unknown>;
-      const { response, trace } = executeLocalZkOracle(call.name, argsObj, params.vault);
+      const { response, trace } = executeLocalZkOracle(call.name, argsObj, params.vault, dpOptions);
       oracleTraces.push(trace);
 
       wireTap.record({
@@ -209,7 +229,7 @@ export async function runDealRoomOracleAudit(params: {
         inferenceSource: "DETERMINISTIC_LOCAL",
         latencyMs: trace.latencyMs,
         bytesSent: 0,
-        payloadPreview: `LOCAL ORACLE ${call.name}(${JSON.stringify(argsObj)}) -> ${JSON.stringify(response)} [0B Raw PII]`,
+        payloadPreview: `LOCAL ORACLE ${call.name}(${JSON.stringify(argsObj)}) -> ${JSON.stringify(response)} [${trace.dpApplied ? `ε=${trace.dpEpsilon} Laplace DP · ` : ""}0B Raw PII]`,
       });
 
       return {
@@ -223,6 +243,19 @@ export async function runDealRoomOracleAudit(params: {
 
     result = await chat.sendMessage(responseParts);
   }
+
+  const thinkingTrace = await buildThinkingAuditTrace({
+    response: result.response,
+    vault: params.vault,
+    requestedDepth: thinkingDepth,
+  });
+  wireTap.record({
+    stage: "THINKING_AUDIT",
+    inferenceSource: "DETERMINISTIC_LOCAL",
+    latencyMs: 1,
+    bytesSent: 0,
+    payloadPreview: `ZK-ORACLE THOUGHT AUDIT (${thinkingDepth}): zeroPii=${thinkingTrace.zeroPiiVerified}, summary=${thinkingTrace.summaryAvailable ? `${thinkingTrace.thoughtSummary.length} chars` : "compact"}, sha256=${thinkingTrace.thoughtDigestSha256.slice(0, 14)}…`,
+  });
 
   const sanitizedVerdictMarkdown = result.response.text();
   const rehydratedVerdictMarkdown = params.vault.rehydrate(sanitizedVerdictMarkdown);
@@ -257,5 +290,7 @@ export async function runDealRoomOracleAudit(params: {
     oracleTraces,
     toolRounds,
     latencyMs,
+    dpOptions,
+    thinkingTrace,
   };
 }

@@ -97,6 +97,9 @@ import { neutralizePromptInjections, SAMPLE_INJECTION_PAYLOAD, type PromptInject
 import { DEAL_ROOM_SCENARIOS } from "./data/dealRoomSamples.js";
 import { PolicyStudioPanel } from "./components/PolicyStudioPanel.js";
 import { MerkleSignerPanel } from "./components/MerkleSignerPanel.js";
+import { ThinkingAuditDrawer } from "./components/ThinkingAuditDrawer.js";
+import { AdaptiveRouterPanel } from "./components/AdaptiveRouterPanel.js";
+import type { AirlockThinkingDepth } from "./utils/thinkingAudit.js";
 import type { CompliancePackId, CustomRegexRule } from "./utils/policyStudio.js";
 import type { StreamingAuditSnapshot } from "./utils/streamRehydrator.js";
 import { runDealRoomLocalAirlock, runDealRoomOracleAudit, type DealRoomAirlockOutput, type DealRoomOracleAuditOutput } from "./services/dealRoomPipeline.js";
@@ -160,6 +163,11 @@ export default function App() {
   const [enabledPolicyPacks, setEnabledPolicyPacks] = useState<CompliancePackId[]>([]);
   const [customRegexRules, setCustomRegexRules] = useState<CustomRegexRule[]>([]);
   const [streamSnap, setStreamSnap] = useState<StreamingAuditSnapshot | null>(null);
+
+  // Sprint F1: Thinking Depth Selector + Laplace ε-DP Oracle Privacy
+  const [thinkingDepth, setThinkingDepth] = useState<AirlockThinkingDepth>("MEDIUM");
+  const [dpEnabled, setDpEnabled] = useState<boolean>(false);
+  const [dpEpsilon, setDpEpsilon] = useState<number>(1.0);
   const effectiveOnline = isOnline && !airGapSimulated;
 
   const [busy, setBusy] = useState<string | null>(null);
@@ -841,6 +849,7 @@ export default function App() {
         policyProfile: policy.profile,
         templateIdOverride: policy.templateId,
         auditMode,
+        thinkingDepth,
         onStreamUpdate: (snap) => {
           setStreamSnap(snap);
         },
@@ -921,6 +930,8 @@ export default function App() {
         verified: dealRoomOut.firewallResult.payload,
         vault: dealRoomOut.vault,
         policyProfile: policy.profile,
+        thinkingDepth,
+        dpOptions: { enabled: dpEnabled, epsilon: dpEpsilon },
         onLedgerSynced: () => {
           fetchZeroPiiAuditLedger()
             .then((updated) => {
@@ -1514,6 +1525,55 @@ export default function App() {
                       <div className="row">
                         <button
                           type="button"
+                          onClick={() => setDpEnabled((v) => !v)}
+                          style={{
+                            padding: "4px 9px",
+                            fontSize: "0.72rem",
+                            borderColor: dpEnabled ? "#10b981" : undefined,
+                            color: dpEnabled ? "#34d399" : undefined,
+                          }}
+                          title="Add calibrated CSPRNG Laplace noise to numeric oracle ratios & day deltas while preserving exact compliance verdicts"
+                        >
+                          Laplace ε-DP: {dpEnabled ? `ON (ε=${dpEpsilon})` : "OFF (Exact)"}
+                        </button>
+                        {dpEnabled && (
+                          <select
+                            aria-label="Differential Privacy Epsilon"
+                            value={dpEpsilon}
+                            onChange={(e) => setDpEpsilon(Number(e.target.value))}
+                            style={{
+                              background: "#060a12",
+                              color: "#34d399",
+                              border: "1px solid rgba(16, 185, 129, 0.45)",
+                              borderRadius: 6,
+                              padding: "4px 6px",
+                              fontSize: "0.71rem",
+                            }}
+                          >
+                            <option value={0.5}>ε = 0.5 (Stronger Noise)</option>
+                            <option value={1.0}>ε = 1.0 (Balanced DP)</option>
+                            <option value={2.0}>ε = 2.0 (Higher Precision)</option>
+                          </select>
+                        )}
+                        <select
+                          aria-label="Gemini Thinking Depth"
+                          value={thinkingDepth}
+                          onChange={(e) => setThinkingDepth(e.target.value as AirlockThinkingDepth)}
+                          style={{
+                            background: "#060a12",
+                            color: "#38bdf8",
+                            border: "1px solid rgba(56, 189, 248, 0.4)",
+                            borderRadius: 6,
+                            padding: "4px 6px",
+                            fontSize: "0.71rem",
+                          }}
+                        >
+                          <option value="LOW">Thinking: LOW</option>
+                          <option value="MEDIUM">Thinking: MEDIUM</option>
+                          <option value="HIGH">Thinking: HIGH</option>
+                        </select>
+                        <button
+                          type="button"
                           className="cloud"
                           disabled={
                             busy !== null ||
@@ -1539,6 +1599,19 @@ export default function App() {
                             across {oracleOut.toolRounds} round(s) · {oracleOut.latencyMs} ms ·{" "}
                             <strong>0B Raw Numbers / Dates / IBANs Sent</strong>
                           </div>
+
+                          {oracleOut.dpOptions.enabled && (
+                            <div className="badge green" style={{ alignSelf: "flex-start", fontSize: "0.7rem" }}>
+                              (ε={oracleOut.dpOptions.epsilon}, 0)-Laplace Differential Privacy Active on Numeric Predicates
+                            </div>
+                          )}
+                          {oracleOut.thinkingTrace && (
+                            <ThinkingAuditDrawer
+                              trace={oracleOut.thinkingTrace}
+                              entries={dealRoomOut.vault.getEntries(false)}
+                              viewMode={zkViewMode}
+                            />
+                          )}
 
                           {/* Oracle Call Trace Cards */}
                           {oracleOut.oracleTraces.map((tr, i) => (
@@ -1808,6 +1881,23 @@ export default function App() {
                       <Zap size={14} />
                       {busy === "triage" ? "Triaging..." : "Offline Triage"}
                     </button>
+                    <select
+                      aria-label="Cloud Audit Thinking Depth"
+                      value={thinkingDepth}
+                      onChange={(e) => setThinkingDepth(e.target.value as AirlockThinkingDepth)}
+                      style={{
+                        background: "#060a12",
+                        color: "#38bdf8",
+                        border: "1px solid rgba(56, 189, 248, 0.4)",
+                        borderRadius: 8,
+                        padding: "5px 8px",
+                        fontSize: "0.73rem",
+                      }}
+                    >
+                      <option value="LOW">Thinking: LOW</option>
+                      <option value="MEDIUM">Thinking: MEDIUM</option>
+                      <option value="HIGH">Thinking: HIGH</option>
+                    </select>
                     <button
                       type="button"
                       className="cloud"
@@ -1913,6 +2003,14 @@ export default function App() {
                         />
                       </div>
                     </div>
+                  )}
+
+                  {cloudOut?.thinkingTrace && airlockOut && (
+                    <ThinkingAuditDrawer
+                      trace={cloudOut.thinkingTrace}
+                      entries={airlockOut.vault.getEntries(false)}
+                      viewMode={zkViewMode}
+                    />
                   )}
 
                   {cloudOut?.streamMetrics && (
@@ -2120,6 +2218,13 @@ export default function App() {
           {/* ================= TAB 2: RED-TEAM LAB, WIRE TAP & HYBRID ROUTING ================= */}
           {activeTab === "redteam" && (
             <>
+              <AdaptiveRouterPanel
+                effectiveOnline={effectiveOnline}
+                airGapActive={airGapSimulated}
+                nanoAvailable={nanoStatus === "available"}
+                payloadBytes={new TextEncoder().encode(rawText).byteLength}
+                onApplyRecommendedDepth={(d) => setThinkingDepth(d)}
+              />
               {/* ADAPTIVE HYBRID ROUTING VISUALIZER + ENTERPRISE ROI METER */}
               <div className="wire-item" style={{ gap: 8 }}>
                 <div className="row" style={{ justifyContent: "space-between" }}>

@@ -14,6 +14,7 @@ import {
 import type { Part } from "firebase/ai";
 import {
   checkLocalNanoStatus,
+  createThinkingModel,
   getFirebaseHandles,
   POLICY_TEMPLATES,
   writeZeroPiiAuditLedger,
@@ -23,6 +24,7 @@ import { wireTap } from "./wireTap.js";
 import { neutralizePromptInjections, type PromptInjectionReport } from "../utils/promptInjectionGuard.js";
 import { scanPolicyAsCodeSpans, type CompliancePackId, type CustomRegexRule } from "../utils/policyStudio.js";
 import { TokenBoundaryStreamFsm, type StreamFsmMetrics, type StreamingAuditSnapshot } from "../utils/streamRehydrator.js";
+import { buildThinkingAuditTrace, type AirlockThinkingDepth, type ThinkingAuditTrace } from "../utils/thinkingAudit.js";
 import {
   analyzeResidualRisks,
   quasiHitsToSpans,
@@ -76,6 +78,7 @@ export interface CloudAuditOutput {
   readonly latencyMs: number;
   readonly ledgerDocId: string | null;
   readonly streamMetrics?: StreamFsmMetrics;
+  readonly thinkingTrace?: ThinkingAuditTrace | null;
 }
 
 interface NanoExtractionJson {
@@ -355,6 +358,7 @@ export async function runDeepCloudAudit(params: {
   policyProfile: PolicyProfile;
   templateIdOverride?: string;
   auditMode?: "SERVER_TEMPLATE" | "STRUCTURED_JSON";
+  thinkingDepth?: AirlockThinkingDepth;
   onLedgerSynced?: (docId: string) => void;
   onStreamUpdate?: (snapshot: StreamingAuditSnapshot) => void;
 }): Promise<CloudAuditOutput> {
@@ -371,6 +375,8 @@ export async function runDeepCloudAudit(params: {
   let usedServerTemplate = false;
   let effectiveMode: "SERVER_TEMPLATE" | "STRUCTURED_JSON" = requestedMode;
   let streamMetrics: StreamFsmMetrics | undefined;
+  let thinkingTrace: ThinkingAuditTrace | null = null;
+  const thinkingDepth: AirlockThinkingDepth = params.thinkingDepth ?? "MEDIUM";
 
   if (requestedMode === "STRUCTURED_JSON") {
     const schemaPrompt =
@@ -378,8 +384,49 @@ export async function runDeepCloudAudit(params: {
       `Return structured JSON matching the schema with 3 high-impact clause redlines. ` +
       `CRITICAL RULE: Preserve all redacted placeholder tokens like [ORG_1], [PERSON_1], [CURRENCY_1], [SECRET_TERM_1] verbatim so the client can re-hydrate locally.\n\n` +
       `Sanitized Document:\n${params.verified.sanitizedText}`;
-    const res = await handles.structuredAuditModel.generateContent(schemaPrompt);
-    const rawJson = JSON.parse(res.response.text()) as Partial<StructuredAuditPayload>;
+    const parseStructuredJson = (rawText: string): Partial<StructuredAuditPayload> => {
+      const cleaned = rawText
+        .trim()
+        .replace(/^```(?:json)?\s*/i, "")
+        .replace(/\s*```$/i, "")
+        .trim();
+      return JSON.parse(cleaned) as Partial<StructuredAuditPayload>;
+    };
+
+    let res;
+    let rawJson: Partial<StructuredAuditPayload>;
+    try {
+      const thinkingStructModel = createThinkingModel({
+        ai: handles.ai,
+        depth: thinkingDepth,
+        structuredSchema: handles.structuredAuditModel.generationConfig?.responseSchema as never,
+        maxOutputTokens: thinkingDepth === "HIGH" ? 8192 : thinkingDepth === "MEDIUM" ? 4096 : 2048,
+      });
+      res = await thinkingStructModel.generateContent(schemaPrompt);
+      thinkingTrace = await buildThinkingAuditTrace({
+        response: res.response,
+        vault: params.vault,
+        requestedDepth: thinkingDepth,
+      });
+      rawJson = parseStructuredJson(res.response.text());
+    } catch {
+      res = await handles.structuredAuditModel.generateContent(schemaPrompt);
+      if (!thinkingTrace) {
+        thinkingTrace = await buildThinkingAuditTrace({
+          response: res.response,
+          vault: params.vault,
+          requestedDepth: thinkingDepth,
+        });
+      }
+      rawJson = parseStructuredJson(res.response.text());
+    }
+    wireTap.record({
+      stage: "THINKING_AUDIT",
+      inferenceSource: "DETERMINISTIC_LOCAL",
+      latencyMs: 1,
+      bytesSent: 0,
+      payloadPreview: `STRUCTURED JSON THOUGHT AUDIT (${thinkingDepth}): zeroPii=${thinkingTrace.zeroPiiVerified}, summary=${thinkingTrace.summaryAvailable ? `${thinkingTrace.thoughtSummary.length} chars` : "compact"}, sha256=${thinkingTrace.thoughtDigestSha256.slice(0, 14)}…`,
+    });
     const normalizedClauses: StructuredRedlineClause[] = Array.isArray(rawJson.clauses)
       ? rawJson.clauses.slice(0, 5).map((c) => ({
           clauseTitle: String(c.clauseTitle ?? "Compliance Clause"),
@@ -418,6 +465,16 @@ export async function runDeepCloudAudit(params: {
       sanitizedMarkdown = finalSnap.sanitizedSoFar;
       streamMetrics = finalSnap.metrics;
       usedServerTemplate = true;
+      try {
+        const agg = await streamRes.response;
+        thinkingTrace = await buildThinkingAuditTrace({
+          response: agg,
+          vault: params.vault,
+          requestedDepth: thinkingDepth,
+        });
+      } catch {
+        thinkingTrace = null;
+      }
     } catch {
       const fsm = new TokenBoundaryStreamFsm(params.vault, t0);
       const fallbackPrompt =
@@ -496,5 +553,6 @@ export async function runDeepCloudAudit(params: {
     latencyMs,
     ledgerDocId,
     streamMetrics,
+    thinkingTrace,
   };
 }
