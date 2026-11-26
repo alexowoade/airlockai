@@ -99,6 +99,8 @@ import { PolicyStudioPanel } from "./components/PolicyStudioPanel.js";
 import { MerkleSignerPanel } from "./components/MerkleSignerPanel.js";
 import { ThinkingAuditDrawer } from "./components/ThinkingAuditDrawer.js";
 import { AdaptiveRouterPanel } from "./components/AdaptiveRouterPanel.js";
+import { AudioAirlockPanel } from "./components/AudioAirlockPanel.js";
+import { MultilingualAirlockPanel } from "./components/MultilingualAirlockPanel.js";
 import type { AirlockThinkingDepth } from "./utils/thinkingAudit.js";
 import type { CompliancePackId, CustomRegexRule } from "./utils/policyStudio.js";
 import type { StreamingAuditSnapshot } from "./utils/streamRehydrator.js";
@@ -967,6 +969,46 @@ export default function App() {
     setCustomRegexRules((prev) => prev.filter((r) => r.id !== id));
   }
 
+  async function handleStageAndRunText(
+    nextText: string,
+    nextPolicy: PolicyProfile,
+    sourceLabel: string
+  ) {
+    setStageMode("single");
+    setRawText(nextText);
+    setImageInput(null);
+    setPdfDoc(null);
+    setUploadedFileName(sourceLabel);
+    handleSelectPolicy(nextPolicy);
+    setErrorMsg(null);
+    setTriageOut(null);
+    setCloudOut(null);
+    setStreamSnap(null);
+    setBusy("airlock");
+    try {
+      const prevHash = combinedLedger[0]?.receiptSha256 ?? null;
+      const effectivePolicy = {
+        ...policy,
+        profile: nextPolicy,
+        templateId: POLICY_TEMPLATES[nextPolicy],
+      };
+      const result = await runLocalAirlock({
+        rawText: nextText,
+        policy: effectivePolicy,
+        prevReceiptSha256: prevHash,
+        customSecrets,
+        policyPacks: enabledPolicyPacks,
+        customRegexRules,
+        strictSafeHarbor,
+      });
+      setAirlockOut(result);
+    } catch (err) {
+      setErrorMsg(err instanceof Error ? err.message : "Local airlock staging failed.");
+    } finally {
+      setBusy(null);
+    }
+  }
+
   function handlePromptInjectionAttack() {
     const t0 = performance.now();
     const baseText = verifiedPayload?.sanitizedText ?? rawText;
@@ -1238,6 +1280,26 @@ export default function App() {
             onTogglePack={handleTogglePolicyPack}
             onAddRule={handleAddCustomRegexRule}
             onRemoveRule={handleRemoveCustomRegexRule}
+          />
+
+          <AudioAirlockPanel
+            onStageAudioTranscript={(transcript, label) =>
+              void handleStageAndRunText(transcript, "INVOICE_FINANCE", label)
+            }
+          />
+
+          <MultilingualAirlockPanel
+            currentText={rawText}
+            verifiedSanitizedText={
+              airlockOut?.firewallResult.ok
+                ? airlockOut.firewallResult.payload.sanitizedText
+                : null
+            }
+            vault={airlockOut?.vault ?? null}
+            zkViewMode={zkViewMode}
+            onLoadMultilingualSample={(text, samplePolicy, label) =>
+              void handleStageAndRunText(text, samplePolicy, label)
+            }
           />
 
           {/* LOCAL FILE DROPZONE (PDF + TEXT + IMAGE, 100% ON-DEVICE) */}

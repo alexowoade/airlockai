@@ -23,6 +23,7 @@ import {
 import { wireTap } from "./wireTap.js";
 import { neutralizePromptInjections, type PromptInjectionReport } from "../utils/promptInjectionGuard.js";
 import { scanPolicyAsCodeSpans, type CompliancePackId, type CustomRegexRule } from "../utils/policyStudio.js";
+import { scanMultilingualPiiSpans } from "../utils/multilingualAirlock.js";
 import { TokenBoundaryStreamFsm, type StreamFsmMetrics, type StreamingAuditSnapshot } from "../utils/streamRehydrator.js";
 import { buildThinkingAuditTrace, type AirlockThinkingDepth, type ThinkingAuditTrace } from "../utils/thinkingAudit.js";
 import {
@@ -224,7 +225,7 @@ export async function runLocalAirlock(params: {
   // Gate 1: Deterministic Regex + Luhn + Shannon Entropy + Named-Entity Rules (< 5ms)
   const g1Start = performance.now();
   const rawDoc = asRawDocument(workingText);
-  const gate1Spans = scanDeterministicPii(rawDoc);
+  const gate1Spans = [...scanDeterministicPii(rawDoc), ...scanMultilingualPiiSpans(workingText)];
 
   // Optional Strict HIPAA Safe Harbor quasi-identifier spans + user Custom Secrets
   const safeHarborSpans = params.strictSafeHarbor ? quasiHitsToSpans(workingText) : [];

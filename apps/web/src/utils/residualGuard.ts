@@ -47,6 +47,15 @@ const COMMON_CAPITALIZED_WORDS = new Set([
   "states", "strict", "subject", "summary", "swift", "tax", "term", "terms",
   "texas", "the", "this", "to", "total", "type", "uk", "under", "united",
   "unpaid", "url", "us", "usa", "vendor", "wire", "with", "within", "york", "zip",
+
+  // Localized German/French/Spanish legal nouns (prevents false proper-noun locks on EU contracts)
+  "anlage", "auftraggeber", "auftragnehmer", "gegenstand", "entwicklung", "preisobergrenze",
+  "vergütung", "zahlungsweg", "überweisung", "haftung", "empfänger", "übertragung", "rechte",
+  "kontakt", "unterzeichner", "geheimhaltungsvereinbarung", "annexe", "client", "prestataire",
+  "signataire", "objet", "plafond", "compte", "responsabilité", "orden", "emisor", "receptor",
+  "firmante", "referencia", "importe", "cuenta", "cláusula", "caller", "counterparty",
+  "engagement", "reference", "instructed", "transfer", "audit", "warning", "voice", "memo",
+  "executive", "treasury", "call",
 ]);
 
 /**

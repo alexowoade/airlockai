@@ -17,7 +17,9 @@ export interface WireEvent {
     | "STREAM_FSM"
     | "MERKLE_ECDSA"
     | "THINKING_AUDIT"
-    | "ADAPTIVE_ROUTING";
+    | "ADAPTIVE_ROUTING"
+    | "AUDIO_AIRLOCK"
+    | "MULTILINGUAL_AIRLOCK";
   readonly inferenceSource: "ON_DEVICE" | "IN_CLOUD" | "DETERMINISTIC_LOCAL" | "BLOCKED";
   readonly latencyMs: number;
   readonly bytesSent: number;
