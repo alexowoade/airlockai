@@ -19,7 +19,8 @@ export interface WireEvent {
     | "THINKING_AUDIT"
     | "ADAPTIVE_ROUTING"
     | "AUDIO_AIRLOCK"
-    | "MULTILINGUAL_AIRLOCK";
+    | "MULTILINGUAL_AIRLOCK"
+    | "WEBAUTHN_PRF";
   readonly inferenceSource: "ON_DEVICE" | "IN_CLOUD" | "DETERMINISTIC_LOCAL" | "BLOCKED";
   readonly latencyMs: number;
   readonly bytesSent: number;

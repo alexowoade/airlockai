@@ -101,6 +101,7 @@ import { ThinkingAuditDrawer } from "./components/ThinkingAuditDrawer.js";
 import { AdaptiveRouterPanel } from "./components/AdaptiveRouterPanel.js";
 import { AudioAirlockPanel } from "./components/AudioAirlockPanel.js";
 import { MultilingualAirlockPanel } from "./components/MultilingualAirlockPanel.js";
+import { PasskeyVaultPanel } from "./components/PasskeyVaultPanel.js";
 import type { AirlockThinkingDepth } from "./utils/thinkingAudit.js";
 import type { CompliancePackId, CustomRegexRule } from "./utils/policyStudio.js";
 import type { StreamingAuditSnapshot } from "./utils/streamRehydrator.js";
@@ -2740,6 +2741,23 @@ export default function App() {
                   })}
                 </div>
               )}
+
+              <PasskeyVaultPanel
+                policyProfile={policy.profile}
+                receiptSha256={
+                  airlockOut?.firewallResult.ok
+                    ? airlockOut.firewallResult.payload.receipt.receiptSha256
+                    : null
+                }
+                vault={airlockOut?.vault ?? null}
+                sanitizedText={
+                  airlockOut?.firewallResult.ok
+                    ? airlockOut.firewallResult.payload.sanitizedText
+                    : null
+                }
+                sanitizedAuditMarkdown={cloudOut?.sanitizedMarkdown ?? null}
+                zkViewMode={zkViewMode}
+              />
 
               {/* PASSPHRASE-LOCKED .AIRLOCK.ENC VAULT EXPORT & RESTORE */}
               <div style={{ borderTop: "1px solid var(--border)", paddingTop: 12 }}>
