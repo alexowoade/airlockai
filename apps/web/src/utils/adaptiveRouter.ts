@@ -3,7 +3,19 @@ export type AdaptiveRouteDecision =
   | "PREFER_ON_DEVICE_CONSTRAINED"
   | "HYBRID_LOCAL_AIRLOCK_CLOUD_THINKING";
 
-export type SensorSimulationPreset = "LIVE" | "CONSTRAINED_3G" | "LOW_BATTERY";
+export type SensorSimulationPreset = "LIVE" | "CONSTRAINED_3G" | "LOW_BATTERY" | "CONSTRAINED_3G+LOW_BATTERY";
+
+export interface SensorSimulationFlags {
+  readonly simulate3g: boolean;
+  readonly simulateLowBattery: boolean;
+}
+
+export function formatSimulationLabel(flags: SensorSimulationFlags): SensorSimulationPreset {
+  if (flags.simulate3g && flags.simulateLowBattery) return "CONSTRAINED_3G+LOW_BATTERY";
+  if (flags.simulate3g) return "CONSTRAINED_3G";
+  if (flags.simulateLowBattery) return "LOW_BATTERY";
+  return "LIVE";
+}
 
 export interface HardwareNetworkSnapshot {
   readonly online: boolean;
@@ -52,7 +64,8 @@ export async function sampleHardwareNetworkTelemetry(params: {
   airGapActive: boolean;
   nanoAvailable: boolean;
   payloadBytes: number;
-  preset: SensorSimulationPreset;
+  flags?: SensorSimulationFlags;
+  preset?: SensorSimulationPreset;
 }): Promise<HardwareNetworkSnapshot> {
   const nav = (typeof navigator !== "undefined" ? navigator : {}) as ExtendedNavigator;
   const conn = nav.connection;
@@ -78,15 +91,12 @@ export async function sampleHardwareNetworkTelemetry(params: {
   const cpuCores = typeof nav.hardwareConcurrency === "number" ? nav.hardwareConcurrency : 4;
   const deviceMemoryGb = typeof nav.deviceMemory === "number" ? nav.deviceMemory : null;
 
-  if (params.preset === "CONSTRAINED_3G") {
-    effectiveType = "3g";
-    rttMs = 650;
-    downlinkMbps = 0.7;
-    saveData = true;
-  } else if (params.preset === "LOW_BATTERY") {
-    batteryPct = 12;
-    batteryCharging = false;
-  }
+  const resolvedFlags: SensorSimulationFlags = params.flags ?? {
+    simulate3g: params.preset === "CONSTRAINED_3G" || params.preset === "CONSTRAINED_3G+LOW_BATTERY",
+    simulateLowBattery: params.preset === "LOW_BATTERY" || params.preset === "CONSTRAINED_3G+LOW_BATTERY",
+  };
+  if (resolvedFlags.simulate3g) { effectiveType = "3g"; rttMs = 650; downlinkMbps = 0.7; saveData = true; }
+  if (resolvedFlags.simulateLowBattery) { batteryPct = 12; batteryCharging = false; }
 
   return {
     online: params.effectiveOnline,
@@ -102,7 +112,7 @@ export async function sampleHardwareNetworkTelemetry(params: {
     nanoAvailable: params.nanoAvailable,
     payloadBytes: params.payloadBytes,
     estimatedTokens: Math.max(1, Math.ceil(params.payloadBytes / 4)),
-    simulatedPreset: params.preset,
+    simulatedPreset: formatSimulationLabel(resolvedFlags),
   };
 }
 

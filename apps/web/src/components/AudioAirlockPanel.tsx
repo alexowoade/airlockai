@@ -30,6 +30,7 @@ export function AudioAirlockPanel({ onStageAudioTranscript }: Props) {
   const [transcription, setTranscription] = useState<LocalAudioTranscriptionResult | null>(null);
   const [recording, setRecording] = useState(false);
   const [micError, setMicError] = useState<string | null>(null);
+  const [copiedSha, setCopiedSha] = useState(false);
 
   const recorderRef = useRef<MediaRecorder | null>(null);
   const chunksRef = useRef<Blob[]>([]);
@@ -207,8 +208,9 @@ export function AudioAirlockPanel({ onStageAudioTranscript }: Props) {
                 <span className="badge green" style={{ fontSize: "0.66rem" }}>
                   <ShieldCheck size={11} /> 0B Raw Audio Sent · {transcription.tier}
                 </span>
-                <span className="mono muted" style={{ fontSize: "0.67rem" }}>
+                <span className="mono muted" style={{ fontSize: "0.67rem", display: "inline-flex", alignItems: "center", gap: 5 }} title={artifact.audioSha256}>
                   {artifact.byteLength}B · {artifact.durationSec}s · sha256:{artifact.audioSha256.slice(0, 12)}…
+                  <button type="button" aria-label="Copy full 64-char audio SHA-256" onClick={() => { void navigator.clipboard?.writeText(artifact.audioSha256); setCopiedSha(true); window.setTimeout(() => setCopiedSha(false), 1800); }} style={{ padding: "1px 5px", fontSize: "0.62rem" }}>{copiedSha ? "Copied 64c" : "Copy SHA"}</button>
                 </span>
               </div>
 

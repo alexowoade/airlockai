@@ -154,7 +154,7 @@ export default function App() {
   const [briefExportMsg, setBriefExportMsg] = useState<string | null>(null);
 
   // Sprint E1: Multi-Document Deal Room + Zero-Knowledge Local Oracle Function Calling
-  const [stageMode, setStageMode] = useState<"single" | "dealroom">("single");
+  const [stageMode, setStageMode] = useState<"single" | "dealroom">("dealroom");
   const [docATitle, setDocATitle] = useState(DEAL_ROOM_SCENARIOS[0]!.docATitle);
   const [docAText, setDocAText] = useState(DEAL_ROOM_SCENARIOS[0]!.docAText);
   const [docBTitle, setDocBTitle] = useState(DEAL_ROOM_SCENARIOS[0]!.docBTitle);
@@ -171,6 +171,13 @@ export default function App() {
   const [thinkingDepth, setThinkingDepth] = useState<AirlockThinkingDepth>("MEDIUM");
   const [dpEnabled, setDpEnabled] = useState<boolean>(false);
   const [dpEpsilon, setDpEpsilon] = useState<number>(1.0);
+  const [advancedLabOpen, setAdvancedLabOpen] = useState<boolean>(false);
+  const [copiedHashKey, setCopiedHashKey] = useState<string | null>(null);
+  function handleCopyFullHash(key: string, fullHash: string) {
+    void navigator.clipboard?.writeText(fullHash);
+    setCopiedHashKey(key);
+    window.setTimeout(() => setCopiedHashKey((c) => (c === key ? null : c)), 1800);
+  }
   const effectiveOnline = isOnline && !airGapSimulated;
 
   const [busy, setBusy] = useState<string | null>(null);
@@ -1114,6 +1121,19 @@ export default function App() {
         </div>
       </header>
 
+      {/* SPRINT G: 3-STEP JUDGE CLARITY STRIP */}
+      <div style={{ display: "flex", flexWrap: "wrap", justifyContent: "space-between", alignItems: "center", gap: 8, padding: "8px 12px", marginBottom: 10, borderRadius: 10, border: "1px solid rgba(16, 185, 129, 0.35)", background: "linear-gradient(90deg, rgba(16,185,129,0.08), rgba(56,189,248,0.06))" }}>
+        <div className="row" style={{ gap: 6, flexWrap: "wrap", alignItems: "center", fontSize: "0.73rem" }}>
+          <span className="badge green" style={{ fontSize: "0.68rem" }}>1. Seal Locally (0B Sent)</span>
+          <span className="muted">-&gt;</span>
+          <span className={(stageMode === "dealroom" ? dealRoomOut?.firewallResult.ok : Boolean(verifiedPayload)) ? "badge green" : "badge blue"} style={{ fontSize: "0.68rem" }}>2. Verify 6/6 Firewall</span>
+          <span className="muted">-&gt;</span>
+          <span className={(stageMode === "dealroom" ? Boolean(oracleOut) : Boolean(cloudOut)) ? "badge green" : "badge blue"} style={{ fontSize: "0.68rem" }}>3. Audit with Gemini (ZK Oracles / Cloud)</span>
+        </div>
+        <div className="muted" style={{ fontSize: "0.71rem" }}>
+          <strong>Scenario:</strong> Elena Vance (Helios Robotics Corp) verifying Apex Foundry LLC&apos;s $2.1M wire invoice against a $1.45M MSA (synthetic data by design).
+        </div>
+      </div>
       {/* LIVE HYBRID TELEMETRY STRIP */}
       <div
         className="wire-item"
@@ -1273,6 +1293,14 @@ export default function App() {
               </button>
             ))}
           </div>
+          <div style={{ border: "1px solid var(--border)", borderRadius: 10, padding: "7px 10px", background: "rgba(15,23,42,0.42)" }}>
+            <div className="row" style={{ justifyContent: "space-between", alignItems: "center", gap: 6 }}>
+              <button type="button" onClick={() => setAdvancedLabOpen((v) => !v)} style={{ padding: "4px 10px", fontSize: "0.73rem" }}>
+                {advancedLabOpen ? "Hide" : "Open"} Advanced Inputs &amp; Policy Lab (Policy-as-Code, Audio WAV, Multilingual DE/FR/ES)
+              </button>
+              <span className="mono muted" style={{ fontSize: "0.66rem" }}>{advancedLabOpen ? "Expanded" : "Collapsed for clarity"}</span>
+            </div>
+            {advancedLabOpen && (<div style={{ display: "flex", flexDirection: "column", gap: 8, marginTop: 9 }}>
 
           <PolicyStudioPanel
             policy={policy}
@@ -1301,7 +1329,8 @@ export default function App() {
             onLoadMultilingualSample={(text, samplePolicy, label) =>
               void handleStageAndRunText(text, samplePolicy, label)
             }
-          />
+          /></div>)}
+          </div>
 
           {/* LOCAL FILE DROPZONE (PDF + TEXT + IMAGE, 100% ON-DEVICE) */}
           <div
@@ -1532,9 +1561,7 @@ export default function App() {
                       {dealRoomOut.firewallResult.ok ? (
                         <div className="alert-green" style={{ fontSize: "0.76rem" }}>
                           <strong>Shared-Vault SHA-256 Attestation:</strong>{" "}
-                          <span className="mono">
-                            {dealRoomOut.firewallResult.payload.receipt.receiptSha256.slice(0, 22)}…
-                          </span>{" "}
+                          <span className="mono" title={dealRoomOut.firewallResult.payload.receipt.receiptSha256}>{dealRoomOut.firewallResult.payload.receipt.receiptSha256.slice(0, 22)}…</span> <button type="button" aria-label="Copy full 64-char Deal Room SHA-256" onClick={() => handleCopyFullHash("dealroom", dealRoomOut.firewallResult.ok ? dealRoomOut.firewallResult.payload.receipt.receiptSha256 : "")} style={{ padding: "1px 6px", fontSize: "0.64rem", marginRight: 4 }}>{copiedHashKey === "dealroom" ? "Copied 64c" : "Copy 64-char SHA"}</button>{" "}
                           · <strong>{dealRoomOut.entityMatrix.length}</strong> tokens (
                           <strong>
                             {dealRoomOut.entityMatrix.filter((r) => r.inDocA && r.inDocB).length}
@@ -1664,8 +1691,11 @@ export default function App() {
                           </div>
 
                           {oracleOut.dpOptions.enabled && (
-                            <div className="badge green" style={{ alignSelf: "flex-start", fontSize: "0.7rem" }}>
+                            <div style={{ display: "flex", flexDirection: "column", gap: 3 }}>
+                              <div className="badge green" style={{ alignSelf: "flex-start", fontSize: "0.7rem" }}>
                               (ε={oracleOut.dpOptions.epsilon}, 0)-Laplace Differential Privacy Active on Numeric Predicates
+                            </div>
+                            <span className="muted" style={{ fontSize: "0.69rem" }}>Calibrated Laplace noise intentionally perturbs ratios/day deltas to block baseline inversion while keeping compliance verdicts exact. Toggle OFF for exact math (+45%, +46 days).</span>
                             </div>
                           )}
                           {oracleOut.thinkingTrace && (
@@ -1748,7 +1778,7 @@ export default function App() {
                   {verifiedPayload ? (
                     <div className="alert-green">
                       <strong>SHA-256 Attestation Minted:</strong>{" "}
-                      <span className="mono">{verifiedPayload.receipt.receiptSha256.slice(0, 24)}…</span>{" "}
+                      <span className="mono" title={verifiedPayload.receipt.receiptSha256}>{verifiedPayload.receipt.receiptSha256.slice(0, 24)}…</span> <button type="button" aria-label="Copy full 64-char attestation SHA-256" onClick={() => handleCopyFullHash("single", verifiedPayload.receipt.receiptSha256)} style={{ padding: "1px 6px", fontSize: "0.64rem", marginRight: 4 }}>{copiedHashKey === "single" ? "Copied 64c" : "Copy 64-char SHA"}</button>{" "}
                       | Redacted: <strong>{verifiedPayload.receipt.redactedCount}</strong> entities (Gate 1:{" "}
                       {airlockOut.gate1Count}, Nano Gate 2: {airlockOut.gate2Count}
                       {airlockOut.customCount > 0 ? `, Custom: ${airlockOut.customCount}` : ""})

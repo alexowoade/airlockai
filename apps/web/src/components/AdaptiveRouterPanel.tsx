@@ -1,12 +1,13 @@
 import { useEffect, useState } from "react";
-import { Cpu, Gauge, Radio } from "lucide-react";
+import { Cpu, Gauge, Radio, RotateCcw } from "lucide-react";
 import { wireTap } from "../services/wireTap.js";
 import {
   evaluateAdaptiveRoute,
+  formatSimulationLabel,
   sampleHardwareNetworkTelemetry,
   type AdaptiveRoutingVerdict,
   type HardwareNetworkSnapshot,
-  type SensorSimulationPreset,
+  type SensorSimulationFlags,
 } from "../utils/adaptiveRouter.js";
 
 interface Props {
@@ -24,7 +25,10 @@ export function AdaptiveRouterPanel({
   payloadBytes,
   onApplyRecommendedDepth,
 }: Props) {
-  const [preset, setPreset] = useState<SensorSimulationPreset>("LIVE");
+  const [flags, setFlags] = useState<SensorSimulationFlags>({
+    simulate3g: false,
+    simulateLowBattery: false,
+  });
   const [snapshot, setSnapshot] = useState<HardwareNetworkSnapshot | null>(null);
   const [verdict, setVerdict] = useState<AdaptiveRoutingVerdict | null>(null);
 
@@ -35,26 +39,26 @@ export function AdaptiveRouterPanel({
       airGapActive,
       nanoAvailable,
       payloadBytes,
-      preset,
+      flags,
     }).then((snap) => {
       if (!active) return;
-      const v = evaluateAdaptiveRoute(snap);
       setSnapshot(snap);
-      setVerdict(v);
+      setVerdict(evaluateAdaptiveRoute(snap));
     });
     return () => {
       active = false;
     };
-  }, [effectiveOnline, airGapActive, nanoAvailable, payloadBytes, preset]);
+  }, [effectiveOnline, airGapActive, nanoAvailable, payloadBytes, flags]);
 
-  function handleSelectPreset(next: SensorSimulationPreset) {
-    setPreset(next);
+  function applyFlags(next: SensorSimulationFlags) {
+    setFlags(next);
+    const label = formatSimulationLabel(next);
     void sampleHardwareNetworkTelemetry({
       effectiveOnline,
       airGapActive,
       nanoAvailable,
       payloadBytes,
-      preset: next,
+      flags: next,
     }).then((snap) => {
       const v = evaluateAdaptiveRoute(snap);
       setSnapshot(snap);
@@ -65,20 +69,29 @@ export function AdaptiveRouterPanel({
           v.decision === "HYBRID_LOCAL_AIRLOCK_CLOUD_THINKING" ? "IN_CLOUD" : "DETERMINISTIC_LOCAL",
         latencyMs: 1,
         bytesSent: 0,
-        payloadPreview: `ADAPTIVE ROUTER [${next}] -> ${v.decision} (Score ${v.cloudReadinessScore}/100, RTT ${snap.rttMs}ms, Battery ${snap.batteryPct ?? "AC"}%, Recommended Thinking: ${v.recommendedThinkingDepth})`,
+        payloadPreview: `ADAPTIVE ROUTER [${label}] -> ${v.decision} (Score ${v.cloudReadinessScore}/100, RTT ${snap.rttMs}ms, Battery ${snap.batteryPct ?? "AC"}%, Recommended Thinking: ${v.recommendedThinkingDepth})`,
       });
     });
   }
 
+  const chipStyle = (on: boolean) => ({
+    display: "inline-flex",
+    alignItems: "center",
+    gap: 5,
+    padding: "3px 8px",
+    fontSize: "0.71rem",
+    borderRadius: 7,
+    border: `1px solid ${on ? "#f59e0b" : "var(--border)"}`,
+    color: on ? "#fbbf24" : "#cbd5e1",
+    cursor: "pointer",
+  });
+
   return (
-    <div
-      className="wire-item"
-      style={{ gap: 8, marginBottom: 10, borderColor: "rgba(56, 189, 248, 0.45)" }}
-    >
+    <div className="wire-item" style={{ gap: 8, marginBottom: 10, borderColor: "rgba(56, 189, 248, 0.45)" }}>
       <div className="row" style={{ justifyContent: "space-between", alignItems: "center", flexWrap: "wrap", gap: 6 }}>
         <strong style={{ fontSize: "0.84rem" }}>
           <Gauge size={14} style={{ verticalAlign: "middle", marginRight: 5 }} />
-          Real-Time Hardware & Network Adaptive Routing Engine
+          Real-Time Hardware &amp; Network Adaptive Routing Engine
         </strong>
         {verdict && (
           <span
@@ -96,30 +109,33 @@ export function AdaptiveRouterPanel({
         )}
       </div>
 
-      <div className="row" style={{ gap: 6, flexWrap: "wrap", alignItems: "center" }}>
-        <span className="muted" style={{ fontSize: "0.71rem" }}>Telemetry Mode:</span>
-        {(
-          [
-            { id: "LIVE", label: "Live Hardware Sensors" },
-            { id: "CONSTRAINED_3G", label: "Simulate 3G (650ms RTT)" },
-            { id: "LOW_BATTERY", label: "Simulate Low Battery (12%)" },
-          ] as const
-        ).map((opt) => (
+      <div className="row" style={{ gap: 8, flexWrap: "wrap", alignItems: "center" }}>
+        <span className="muted" style={{ fontSize: "0.71rem" }}>Stackable Stress Toggles:</span>
+        <label style={chipStyle(flags.simulate3g)}>
+          <input
+            type="checkbox"
+            checked={flags.simulate3g}
+            onChange={(e) => applyFlags({ ...flags, simulate3g: e.target.checked })}
+          />
+          Simulate 3G (650ms RTT)
+        </label>
+        <label style={chipStyle(flags.simulateLowBattery)}>
+          <input
+            type="checkbox"
+            checked={flags.simulateLowBattery}
+            onChange={(e) => applyFlags({ ...flags, simulateLowBattery: e.target.checked })}
+          />
+          Simulate Low Battery (12%)
+        </label>
+        {(flags.simulate3g || flags.simulateLowBattery) && (
           <button
-            key={opt.id}
             type="button"
-            onClick={() => handleSelectPreset(opt.id)}
-            style={{
-              padding: "3px 8px",
-              fontSize: "0.7rem",
-              borderColor: preset === opt.id ? "#38bdf8" : undefined,
-              color: preset === opt.id ? "#38bdf8" : undefined,
-            }}
+            onClick={() => applyFlags({ simulate3g: false, simulateLowBattery: false })}
+            style={{ padding: "3px 8px", fontSize: "0.7rem" }}
           >
-            {opt.label}
+            <RotateCcw size={11} /> Reset Live
           </button>
-        ))}
-
+        )}
         {verdict && onApplyRecommendedDepth && (
           <button
             type="button"
